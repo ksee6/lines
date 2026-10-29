@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Merzoug"
+    given-names: "Abderrahmene"
+    alias: "Ksee"
+    orcid: "https://orcid.org/0009-0002-7580-2748"
+title: "Lines"
+url: "https://ksee.dev/lines"
+repository-code: "https://github.com/ksee6/lines"
+identifiers:
+  - type: url
+    value: "https://ksee.dev/lines"
+    description: "Official Lines documentation and specification"
