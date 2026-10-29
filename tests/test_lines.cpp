@@ -436,6 +436,290 @@ static void test_channel_zero_disconnect_reason() {
     printf("  -> Bitpacked Tree parsed from JSON, transmitted, and reassembled as JSON on server!\n");
 }
 
+static void test_head_of_line_blocking() {
+    printf("[TEST] Head-of-Line (HOL) Blocking & Out-of-Order Channel Delivery...\n");
+    Lines client;
+    Lines server;
+
+    String secret = "32_byte_secret_key_for_hol_test_";
+    client.manualUpgrade(secret, true, 2);
+    server.manualUpgrade(secret, false, 2);
+
+    Array<String> clientBundles;
+    client.enable([&](String b) { clientBundles.push(b); }, 0, 50, 1024);
+
+    Array<String> deliveredPackets;
+    server.onPacket = [&](Packet p) {
+        deliveredPackets.push(p.payload);
+    };
+
+    // Client pushes 3 packets on channel 5 that respect HOL
+    client.push(Packet(5, String("P0_HOL"), true, true));
+    client.push(Packet(5, String("P1_HOL"), true, true));
+    client.push(Packet(5, String("P2_HOL"), true, true));
+
+    // Also push a packet on channel 5 that does NOT respect HOL
+    client.push(Packet(5, String("P_NO_HOL"), true, false));
+
+    assert(clientBundles.size() == 4);
+
+    // Deliver P1 first (out of order, missing P0)
+    server.parse(clientBundles[1], 0);
+    assert(deliveredPackets.size() == 0); // P1 must wait in HOL queue!
+
+    // Deliver P2 (still missing P0)
+    server.parse(clientBundles[2], 0);
+    assert(deliveredPackets.size() == 0); // P2 must also wait in HOL queue!
+
+    // Deliver P_NO_HOL (does not respect HOL -> must be delivered immediately!)
+    server.parse(clientBundles[3], 0);
+    assert(deliveredPackets.size() == 1);
+    assert(deliveredPackets[0] == "P_NO_HOL");
+
+    // Deliver P0 (the missing piece)
+    server.parse(clientBundles[0], 0);
+    // Now P0, P1, and P2 must all be delivered in strict order!
+    assert(deliveredPackets.size() == 4);
+    assert(deliveredPackets[1] == "P0_HOL");
+    assert(deliveredPackets[2] == "P1_HOL");
+    assert(deliveredPackets[3] == "P2_HOL");
+
+    printf("  -> Head-of-line blocking strictly verified: out-of-order packets queued, no-HOL bypassed, in-order released.\n");
+}
+
+static void test_static_keypair_proofs() {
+    printf("[TEST] Static Keypair ECDH Challenge Proofs (Announce & Upgrade)...\n");
+    Lines client;
+    Lines server;
+
+    // Both parties have static keypairs
+    Keypair clientStatic = Keypair::generate();
+    Keypair serverStatic1 = Keypair::generate();
+    Keypair serverStatic2 = Keypair::generate();
+
+    client.staticKeypairs.push(clientStatic);
+    server.staticKeypairs.push(serverStatic1);
+    server.staticKeypairs.push(serverStatic2);
+
+    String clientWire;
+    String serverWire;
+    client.enable([&](String b) { clientWire = b; }, 0, 10, 1024);
+    server.enable([&](String b) { serverWire = b; }, 0, 10, 1024);
+
+    server.onProbe = [&](Lines::Tree) { return true; };
+    client.onAnnounce = [&]() { return true; };
+    server.onUpgrade = [&]() { return true; };
+
+    // 1. Client probes
+    Lines::Tree sel;
+    client.probe(sel);
+
+    // 2. Server receives probe and sends Announce with proofs for serverStatic1 & serverStatic2
+    server.parse(clientWire, 0);
+
+    // 3. Client processes Announce
+    client.parse(serverWire, 0);
+
+    // Client must have verified both server static public keys
+    assert(client.theirStaticPublics.size() == 2);
+    assert(client.theirStatics.size() == 2);
+    assert(client.theirStaticPublics[0] == serverStatic1.publicKey().asString());
+    assert(client.theirStaticPublics[1] == serverStatic2.publicKey().asString());
+
+    // 4. Server receives Upgrade with proof for clientStatic
+    server.parse(clientWire, 0);
+
+    // Server must have verified client static public key
+    assert(server.theirStaticPublics.size() == 1);
+    assert(server.theirStatics.size() == 1);
+    assert(server.theirStaticPublics[0] == clientStatic.publicKey().asString());
+
+    printf("  -> Static keypair ECDH proof generation and verification verified on both sides.\n");
+}
+
+static void test_key_zeroing_on_destroy() {
+    printf("[TEST] Key Zeroing on destroy() and Destructor Cleanup...\n");
+    {
+        Lines lines;
+        lines.manualUpgrade("32_byte_secret_key_for_zero_test", true, 2);
+        lines.staticKeypairs.push(Keypair::generate());
+        lines.theirStaticPublics.push("dummy_public_key_32_bytes_____!");
+
+        assert(lines.sharedKey.size() == 32);
+        assert(lines.ourDirectionalKey.data[0] != 0 || lines.ourDirectionalKey.data[1] != 0);
+
+        lines.destroy();
+
+        assert(lines.sharedKey.size() == 0);
+        bool allZeroOur = true;
+        for (int i = 0; i < 32; ++i) {
+            if (lines.ourDirectionalKey.data[i] != 0) allZeroOur = false;
+        }
+        assert(allZeroOur);
+        assert(lines.staticKeypairs.size() == 0);
+        assert(lines.theirStaticPublics.size() == 0);
+    }
+    printf("  -> Key zeroing on destroy() and destructor cleanup verified.\n");
+}
+
+static void test_disjoint_sack_and_pretend_intervals() {
+    printf("[TEST] Disjoint SACK Ranges, showReceived(), showUnavailableToRetransmit(), & retransmitFrom...\n");
+    Lines client;
+    Lines server;
+
+    String secret = "32_byte_secret_key_disjoint_sack";
+    client.manualUpgrade(secret, true, 2);
+    server.manualUpgrade(secret, false, 2);
+
+    String sackWire;
+    server.enable([&](String b) { sackWire = b; }, 0, 10, 1024);
+
+    // Populate server window with out-of-order received bundles:
+    // Bundles 2, 3 received -> base advances to 4
+    server.pretendReceived(2, 3);
+    assert(server.base == 4);
+
+    // Out-of-order bundles 6 and 7 received (leaving gap at 4, 5)
+    // and bundle 10 received (leaving gap at 8, 9)
+    server.windowBitmap.set(6 - 4);  // bit 2
+    server.windowBitmap.set(7 - 4);  // bit 3
+    server.windowBitmap.set(10 - 4); // bit 6
+
+    // Verify showReceived() produces exact disjoint intervals
+    Array<FromTo> rxIntervals = server.showReceived();
+    assert(rxIntervals.size() == 3);
+    assert(rxIntervals[0].from == 2 && rxIntervals[0].to == 3);
+    assert(rxIntervals[1].from == 6 && rxIntervals[1].to == 7);
+    assert(rxIntervals[2].from == 10 && rxIntervals[2].to == 10);
+
+    // On server, simulate nonce = 15, and retransmissionBuffer has entries 8 and 9
+    server.nonce = 15;
+    server.retransmissionBuffer[8] = "bundle 8";
+    server.retransmissionBuffer[9] = "bundle 9";
+
+    // showUnavailableToRetransmit() must start at 0, exclude 8 and 9, and end at 14:
+    // Intervals: [0, 7] and [10, 14]
+    Array<FromTo> unavail = server.showUnavailableToRetransmit();
+    assert(unavail.size() == 2);
+    assert(unavail[0].from == 0 && unavail[0].to == 7);
+    assert(unavail[1].from == 10 && unavail[1].to == 14);
+
+    // Send SACK heartbeat from server
+    server.sendSackHeartbeat(0);
+
+    assert(sackWire.size() > 0);
+
+    // Client has retransmission buffer entries
+    for (u64 id = 2; id <= 14; ++id) {
+        client.retransmissionBuffer[id] = String("bundle_") + String(id);
+    }
+
+    // Client parses server SACK heartbeat
+    bool parsed = client.parse(sackWire, 0);
+    assert(parsed);
+
+    // Acknowledged ranges [2, 3], [6, 7], and [10, 10] must be cleared from client retransmissionBuffer
+    assert(!client.retransmissionBuffer.has(2));
+    assert(!client.retransmissionBuffer.has(3));
+    assert(!client.retransmissionBuffer.has(6));
+    assert(!client.retransmissionBuffer.has(7));
+    assert(!client.retransmissionBuffer.has(10));
+
+    // The gap bundles 8, 9 must STILL be in client's retransmissionBuffer!
+    assert(client.retransmissionBuffer.has(8));
+    assert(client.retransmissionBuffer.has(9));
+
+    // Also verify retransmitFrom was set to 0 upon SACK arrival!
+    assert(client.retransmitFrom == 0);
+
+    // Now test retransmitFrom behavior in update():
+    int retransmittedCount = 0;
+    client.enable([&](String) { retransmittedCount++; }, 0, 10, 1024);
+
+    // First update() should retransmit remaining entries (8 and 9)
+    client.update();
+    assert(retransmittedCount == 2);
+    assert(client.retransmitFrom > 9); // retransmitFrom advanced past last retransmitted bundle
+
+    // Calling update() again immediately should NOT retransmit!
+    int beforeCount = retransmittedCount;
+    client.update();
+    assert(retransmittedCount == beforeCount);
+
+    printf("  -> Disjoint SACK intervals, showReceived(), showUnavailableToRetransmit(), & retransmitFrom verified.\n");
+}
+
+static void test_window_bitmap_and_fragment_register_dynamic_size() {
+    printf("[TEST] Dynamic windowBitmap and fragmentationRegister respecting lines.size...\n");
+
+    // 1. Test windowBitmap with size = 256 (> 64 bits)
+    Lines lines;
+    lines.size = 256;
+    lines.manualUpgrade("32_byte_secret_key_size_test___", true, 2);
+
+    assert(lines.windowBitmap.numBits >= 256);
+    assert(!lines.windowBitmap.test(150));
+
+    lines.windowBitmap.set(150);
+    assert(lines.windowBitmap.test(150));
+    assert(!lines.windowBitmap.test(149));
+    assert(!lines.windowBitmap.test(151));
+
+    lines.windowBitmap.shiftRight(50);
+    assert(!lines.windowBitmap.test(150));
+    assert(lines.windowBitmap.test(100)); // 150 shifted right by 50 = 100
+
+    // 2. Test fragmentationRegister respecting lines.size
+    lines.size = 3; // Small size limit
+    lines.fragmentationRegister.clear();
+
+    for (u32 s = 1; s <= 5; ++s) {
+        String fragWire;
+        // Build a fragment packet series
+        Lines sender;
+        sender.manualUpgrade("32_byte_secret_key_size_test___", false, 2);
+        sender.enable([&](String b) { fragWire = b; }, 0, 10, 1024);
+
+        Packet p(1, "frag payload", true, true);
+        p.fragState = 1; // start of fragment series
+        p.seriesId = s;
+        p.fragmentId = 0;
+        sender.push(p);
+
+        lines.parse(fragWire, 0);
+    }
+
+    // fragmentationRegister size must never exceed lines.size (3)
+    assert(lines.fragmentationRegister.size() <= 3);
+
+    printf("  -> Dynamic windowBitmap and fragmentationRegister capacity limits verified.\n");
+}
+
+static void test_fragment_timeout_pruning() {
+    printf("[TEST] Fragment Register Timeout & Pruning...\n");
+    Lines lines;
+    lines.manualUpgrade("32_byte_secret_key_frag_pruning_", true, 2);
+
+    // Simulate an incomplete fragment entry in fragmentationRegister
+    FragmentRegisterEntry entry;
+    entry.seriesId = 99;
+    entry.fragments[0] = "chunk 0";
+    entry.hasStart = true;
+    entry.hasEnd = false;
+    entry.lastUpdated = millis() - 50000; // 50 seconds ago
+
+    lines.fragmentationRegister.push(entry);
+    assert(lines.fragmentationRegister.size() == 1);
+
+    lines.timeout = 20000; // 20s timeout
+    lines.lastSeen = millis(); // Still alive
+    lines.update();
+
+    // Expired fragment must be pruned!
+    assert(lines.fragmentationRegister.size() == 0);
+    printf("  -> Stale fragment series successfully pruned after timeout.\n");
+}
+
 int main() {
     printf("=== Running Lines Protocol Test Suite ===\n");
     test_multiband_properties();
@@ -450,6 +734,12 @@ int main() {
     test_backpressure_retransmission_buffer();
     test_sacrificial_heartbeats_on_alternate_bands();
     test_channel_zero_disconnect_reason();
+    test_head_of_line_blocking();
+    test_static_keypair_proofs();
+    test_key_zeroing_on_destroy();
+    test_disjoint_sack_and_pretend_intervals();
+    test_fragment_timeout_pruning();
+    test_window_bitmap_and_fragment_register_dynamic_size();
     printf("=== ALL LINES TESTS PASSED! ===\n");
     return 0;
 }

@@ -26,6 +26,119 @@ namespace Ksee {
 using Keypair = XKeypair;
 
 /**
+ * @struct FromTo
+ * @brief Represents a closed interval [from, to] for SACK heartbeats.
+ */
+struct FromTo {
+    u64 from = 0;
+    u64 to = 0;
+
+    FromTo() = default;
+    FromTo(u64 f, u64 t) : from(f), to(t) {}
+};
+
+/**
+ * @class Bitmap
+ * @brief Dynamic bitset respecting arbitrary window sizes.
+ */
+class Bitmap {
+public:
+    Array<u64> words;
+    usz numBits = 64;
+
+    Bitmap(usz bits = 64) {
+        resize(bits);
+    }
+
+    void resize(usz bits) {
+        numBits = (bits == 0) ? 64 : bits;
+        usz numWords = (numBits + 63) / 64;
+        words.allocate(numWords);
+        for (usz i = 0; i < words.size(); ++i) {
+            words[i] = 0;
+        }
+    }
+
+    void clear() {
+        for (usz i = 0; i < words.size(); ++i) {
+            words[i] = 0;
+        }
+    }
+
+    void reset() {
+        clear();
+    }
+
+    bool test(usz bit) const {
+        if (bit >= numBits) return false;
+        usz wordIdx = bit / 64;
+        usz bitIdx = bit % 64;
+        if (wordIdx >= words.size()) return false;
+        return (words[wordIdx] & (1ULL << bitIdx)) != 0;
+    }
+
+    void set(usz bit, bool value = true) {
+        if (bit >= numBits) {
+            resize(bit + 64);
+        }
+        usz wordIdx = bit / 64;
+        usz bitIdx = bit % 64;
+        if (wordIdx >= words.size()) return;
+        if (value) {
+            words[wordIdx] |= (1ULL << bitIdx);
+        } else {
+            words[wordIdx] &= ~(1ULL << bitIdx);
+        }
+    }
+
+    void shiftRight(usz count) {
+        if (count == 0) return;
+        if (count >= numBits) {
+            clear();
+            return;
+        }
+        usz wordShift = count / 64;
+        usz bitShift = count % 64;
+        usz numWords = words.size();
+
+        for (usz i = 0; i < numWords; ++i) {
+            usz src = i + wordShift;
+            u64 low = (src < numWords) ? (words[src] >> bitShift) : 0ULL;
+            u64 high = 0ULL;
+            if (bitShift > 0 && src + 1 < numWords) {
+                high = words[src + 1] << (64 - bitShift);
+            }
+            words[i] = low | high;
+        }
+    }
+
+    Bitmap &operator=(u64 val) {
+        clear();
+        if (words.size() > 0) words[0] = val;
+        return *this;
+    }
+
+    u64 operator&(u64 mask) const {
+        if (words.size() == 0) return 0;
+        return words[0] & mask;
+    }
+
+    Bitmap &operator>>=(u64 shift) {
+        shiftRight(shift);
+        return *this;
+    }
+
+    Bitmap &operator|=(u64 mask) {
+        if (words.size() > 0) words[0] |= mask;
+        return *this;
+    }
+
+    bool operator[](usz bit) const {
+        return test(bit);
+    }
+};
+
+/**
  * @struct Packet
  * @brief Individual multiplexed data unit carried inside Lines bundles.
  */
@@ -37,6 +150,7 @@ struct Packet {
     u8 fragState = 0;       ///< 0=none, 1=start, 2=middle, 3=end
     u32 seriesId = 0;
     u32 fragmentId = 0;
+    u32 channelSeq = 0;     ///< Per-channel sequence for HOL blocking
 
     Packet() = default;
     Packet(u32 ch, const String &p, bool important = true, bool hol = true)
@@ -52,6 +166,7 @@ public:
     u32 seriesId = 0;
     u32 channel = 1;
     bool respectsHol = true;
+    u32 channelSeq = 0;
     bool hasStart = false;
     bool hasEnd = false;
     u32 endFragmentId = 0;
@@ -80,6 +195,7 @@ public:
     Tree selector;                   ///< Probing selector tree
     Array<Keypair> staticKeypairs;   ///< Static keypairs to prove to peer
     Array<String> theirStaticPublics;///< Static public keys proven by peer
+    Array<String> theirStatics;      ///< Synced alias for theirStaticPublics
 
     // --- Directional Session Keys & Configuration ---
     String sharedKey;                ///< 32-byte shared root session key
@@ -89,7 +205,8 @@ public:
     u32 size = 64;                   ///< Window size and retransmission buffer capacity
     u64 nonce = 2;                   ///< Last sent bundle nonce / ID
     u64 base = 2;                    ///< Sliding window base bundle ID
-    u64 windowBitmap = 0;            ///< 64-bit sliding window bitmap
+    Bitmap windowBitmap;             ///< Dynamic sliding window bitmap respecting size
+    u64 retransmitFrom = 0;          ///< Retransmission offset / cursor
 
     u64 lastSeen = 0;                ///< Timestamp (millis) of last received bundle
     u64 lastSent = 0;                ///< Timestamp (millis) of last sent bundle
@@ -135,7 +252,7 @@ public:
 
     // --- Lifecycle & Initialization ---
     Lines();
-    ~Lines() = default;
+    ~Lines();
 
     bool isUpgraded() const { return sharedKey.size() > 0; }
     void probe(const Tree &sel);
@@ -154,6 +271,8 @@ public:
     // --- Data Transmission & Sliding Window ---
     void push(const Packet &packet);
     void pretendReceived(u64 from, u64 to);
+    Array<FromTo> showReceived() const;
+    Array<FromTo> showUnavailableToRetransmit() const;
 
     // --- Parsing & Roaming Engine ---
     bool parse(const String &bundle, u32 band = 0);
@@ -163,6 +282,7 @@ public:
     // --- Periodic Scheduler & Retransmission ---
     void update();
     void tick() { update(); }
+    void sendSackHeartbeat(u32 targetBand = 0);
 
 private:
     void setupDirectionalKeys();
@@ -170,7 +290,6 @@ private:
     void flushQueues();
     void sendPostUpgradeBundle(bool important, u32 bandId);
     void sendSacrificialSack(u32 excludeBand);
-    void sendSackHeartbeat(u32 targetBand);
     void transmitRaw(const String &bundle, u32 bandId);
     void advanceWindow(u64 newBase);
     void dispatchPacket(const Packet &packet, u32 seq);
@@ -189,5 +308,7 @@ private:
 // Global alias for compatibility
 using Lines = Ksee::Lines;
 using Packet = Ksee::Packet;
+using FromTo = Ksee::FromTo;
+using Bitmap = Ksee::Bitmap;
 
 #endif // LINES_LINES_HPP

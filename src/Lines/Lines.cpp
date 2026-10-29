@@ -4,6 +4,7 @@
  */
 
 #include "../../include/Lines/Lines.hpp"
+#include <stdio.h>
 #include <Ksee/Crypto/AEAD.hpp>
 
 namespace Ksee {
@@ -87,6 +88,12 @@ Lines::Lines() {
     epheKeypair = Keypair::generate();
     lastSeen = millis();
     lastSent = millis();
+    windowBitmap.resize(size);
+    retransmitFrom = 0;
+}
+
+Lines::~Lines() {
+    destroy();
 }
 
 void Lines::setupDirectionalKeys() {
@@ -225,21 +232,25 @@ void Lines::manualUpgrade(const String &key, bool isInitiator, u64 initialNonce)
     initiator = isInitiator;
     nonce = initialNonce;
     base = initialNonce;
-    windowBitmap = 0;
+    windowBitmap.resize(size);
+    windowBitmap.clear();
+    retransmitFrom = 0;
     setupDirectionalKeys();
     if (onReady) onReady();
 }
 
 void Lines::pretendReceived(u64 from, u64 to) {
+    if (from > to) return;
+
     for (u64 id = from; id <= to; ++id) {
-        if (id >= base && id < base + size) {
-            u64 delta = id - base;
-            windowBitmap |= (1ULL << delta);
+        if (id < base) continue;
+        if (id >= base + size) break;
+        u64 delta = id - base;
+        windowBitmap.set(delta);
+        while (windowBitmap.test(0)) {
+            windowBitmap.shiftRight(1);
+            base++;
         }
-    }
-    while (windowBitmap & 1ULL) {
-        windowBitmap >>= 1ULL;
-        base++;
     }
 }
 
@@ -250,7 +261,36 @@ void Lines::destroy() {
     pendingUnimportantQueue.destroy();
     fragmentationRegister.destroy();
     channelSequences.clear();
-    sharedKey.clear();
+    outgoingChannelSeq.clear();
+    windowBitmap.clear();
+    retransmitFrom = 0;
+
+    // Securely wipe cryptographic keys
+    if (sharedKey.size() > 0) {
+        memset((void*)sharedKey.data(), 0, sharedKey.size());
+        sharedKey.clear();
+    }
+    memset(ourDirectionalKey.data, 0, sizeof(ourDirectionalKey.data));
+    memset(theirDirectionalKey.data, 0, sizeof(theirDirectionalKey.data));
+    memset(theirEphePublic.data, 0, sizeof(theirEphePublic.data));
+    memset((void*)&epheKeypair, 0, sizeof(epheKeypair));
+
+    for (usz i = 0; i < staticKeypairs.size(); ++i) {
+        memset((void*)&staticKeypairs[i], 0, sizeof(Keypair));
+    }
+    staticKeypairs.destroy();
+
+    for (usz i = 0; i < theirStaticPublics.size(); ++i) {
+        if (theirStaticPublics[i].size() > 0) {
+            memset((void*)theirStaticPublics[i].data(), 0, theirStaticPublics[i].size());
+        }
+    }
+    theirStaticPublics.destroy();
+    theirStatics.destroy();
+
+    metadata.clear();
+    theirMetadata.clear();
+    selector.clear();
 }
 
 void Lines::disconnect(const Tree &reason) {
@@ -340,6 +380,8 @@ void Lines::handleProbe(const String &payload, u32 bandId) {
 
     writeVarLong(toSign, (u64)staticKeypairs.size());
     for (usz i = 0; i < staticKeypairs.size(); ++i) {
+        const u256 &pub = staticKeypairs[i].publicKey();
+        toSign.append(pub.data, 32);
         u256 proofShared = staticKeypairs[i].sharedKey(clientPub);
         u8 proofTag[8];
         computeMac(proofTag, proofShared, 0, nullptr, 0);
@@ -404,8 +446,20 @@ void Lines::handleAnnounce(const String &payload, u32 bandId) {
 
     u64 numProofs = readVarLong(payload, at);
     theirStaticPublics.clear();
-    for (u64 p = 0; p < numProofs && (at + 8 <= payload.size()); ++p) {
-        at += 8; // Verified via static registry if configured
+    theirStatics.clear();
+    for (u64 p = 0; p < numProofs && (at + 40 <= payload.size()); ++p) {
+        u256 srvStaticPub((const u8*)payload.data() + at);
+        at += 32;
+        u8 receivedTag[8];
+        for (int i = 0; i < 8; ++i) receivedTag[i] = (u8)payload[at + i];
+        at += 8;
+
+        u256 proofShared = epheKeypair.sharedKey(srvStaticPub);
+        if (verifyMac(receivedTag, proofShared, 0, nullptr, 0)) {
+            String pubStr = srvStaticPub.asString();
+            theirStaticPublics.push(pubStr);
+            theirStatics.push(pubStr);
+        }
     }
 
     if (at < payload.size()) {
@@ -421,6 +475,8 @@ void Lines::handleAnnounce(const String &payload, u32 bandId) {
     String toSign;
     writeVarLong(toSign, (u64)staticKeypairs.size());
     for (usz i = 0; i < staticKeypairs.size(); ++i) {
+        const u256 &pub = staticKeypairs[i].publicKey();
+        toSign.append(pub.data, 32);
         u256 proofShared = staticKeypairs[i].sharedKey(srvPub);
         u8 proofTag[8];
         computeMac(proofTag, proofShared, 1, nullptr, 0);
@@ -457,7 +513,9 @@ void Lines::handleAnnounce(const String &payload, u32 bandId) {
     // Switch to live post-upgrade state with nonce = 2
     nonce = 2;
     base = 2;
-    windowBitmap = 0;
+    windowBitmap.resize(size);
+    windowBitmap.clear();
+    retransmitFrom = 0;
 
     if (onReady) onReady();
 }
@@ -479,8 +537,21 @@ void Lines::handleUpgrade(const String &payload, u32 bandId) {
     }
 
     u64 numProofs = readVarLong(payload, at);
-    for (u64 p = 0; p < numProofs && (at + 8 <= payload.size()); ++p) {
+    theirStaticPublics.clear();
+    theirStatics.clear();
+    for (u64 p = 0; p < numProofs && (at + 40 <= payload.size()); ++p) {
+        u256 cliStaticPub((const u8*)payload.data() + at);
+        at += 32;
+        u8 receivedTag[8];
+        for (int i = 0; i < 8; ++i) receivedTag[i] = (u8)payload[at + i];
         at += 8;
+
+        u256 proofShared = epheKeypair.sharedKey(cliStaticPub);
+        if (verifyMac(receivedTag, proofShared, 1, nullptr, 0)) {
+            String pubStr = cliStaticPub.asString();
+            theirStaticPublics.push(pubStr);
+            theirStatics.push(pubStr);
+        }
     }
 
     u64 metaLen = readVarLong(payload, at);
@@ -499,7 +570,9 @@ void Lines::handleUpgrade(const String &payload, u32 bandId) {
 
     nonce = 2;
     base = 2;
-    windowBitmap = 0;
+    windowBitmap.resize(size);
+    windowBitmap.clear();
+    retransmitFrom = 0;
 
     if (onReady) onReady();
 }
@@ -510,6 +583,14 @@ void Lines::handleUpgrade(const String &payload, u32 bandId) {
 
 void Lines::push(const Packet &packet) {
     if (!couldPush()) return;
+
+    u32 seq = 0;
+    if (packet.respectsHOL) {
+        if (!outgoingChannelSeq.has(packet.channel)) {
+            outgoingChannelSeq[packet.channel] = 0;
+        }
+        seq = outgoingChannelSeq[packet.channel]++;
+    }
 
     u32 band = selectBestBand(packet.payload.size() + 32);
     u32 bandMtu = bands.has(band) ? bands[band].mtu : 1024;
@@ -535,13 +616,16 @@ void Lines::push(const Packet &packet) {
             fragP.fragState = state;
             fragP.seriesId = sId;
             fragP.fragmentId = (u32)i;
+            fragP.channelSeq = seq;
 
             if (packet.isImportant) pendingImportantQueue.push(fragP);
             else pendingUnimportantQueue.push(fragP);
         }
     } else {
-        if (packet.isImportant) pendingImportantQueue.push(packet);
-        else pendingUnimportantQueue.push(packet);
+        Packet p = packet;
+        p.channelSeq = seq;
+        if (p.isImportant) pendingImportantQueue.push(p);
+        else pendingUnimportantQueue.push(p);
     }
 
     flushQueues();
@@ -590,6 +674,9 @@ void Lines::sendPostUpgradeBundle(bool important, u32 bandId) {
         if (p.fragState != 0) {
             writeVarLong(pBuf, (u64)p.seriesId);
             writeVarLong(pBuf, (u64)p.fragmentId);
+        }
+        if (p.respectsHOL) {
+            writeVarLong(pBuf, (u64)p.channelSeq);
         }
         pBuf.append(p.payload.data(), p.payload.size());
 
@@ -696,7 +783,7 @@ bool Lines::parse(const String &bundle, u32 band) {
     u64 realBundleId = base + offset;
 
     // Duplicate check
-    if (windowBitmap & (1ULL << offset)) {
+    if (windowBitmap.test(offset)) {
         return false; // Replay / duplicate
     }
 
@@ -715,9 +802,9 @@ bool Lines::parse(const String &bundle, u32 band) {
     if (plaintext.size() < 1) return false;
 
     // Update window
-    windowBitmap |= (1ULL << offset);
-    while (windowBitmap & 1ULL) {
-        windowBitmap >>= 1ULL;
+    windowBitmap.set(offset);
+    while (windowBitmap.test(0)) {
+        windowBitmap.shiftRight(1);
         base++;
     }
 
@@ -745,6 +832,10 @@ bool Lines::parse(const String &bundle, u32 band) {
         }
         bool respectsHol = (pHeader & 0x08) != 0;
         bool isFinal = (pHeader & 0x10) != 0;
+        u32 channelSeq = 0;
+        if (respectsHol) {
+            channelSeq = (u32)readVarLong(plaintext, at);
+        }
 
         String payload((const u8*)plaintext.data() + at, pEnd - at);
         at = pEnd;
@@ -764,16 +855,43 @@ bool Lines::parse(const String &bundle, u32 band) {
                     }
                 }
                 if (!entry) {
+                    // Prune expired entries
+                    u64 now = millis();
+                    for (usz i = 0; i < fragmentationRegister.size(); ) {
+                        if (now - fragmentationRegister[i].lastUpdated > timeout) {
+                            fragmentationRegister.remove(i);
+                        } else {
+                            ++i;
+                        }
+                    }
+
+                    // Enforce lines.size capacity limit on fragmentationRegister
+                    while (fragmentationRegister.size() >= size && fragmentationRegister.size() > 0) {
+                        usz oldestIdx = 0;
+                        u64 oldestTime = fragmentationRegister[0].lastUpdated;
+                        for (usz i = 1; i < fragmentationRegister.size(); ++i) {
+                            if (fragmentationRegister[i].lastUpdated < oldestTime) {
+                                oldestTime = fragmentationRegister[i].lastUpdated;
+                                oldestIdx = i;
+                            }
+                        }
+                        fragmentationRegister.remove(oldestIdx);
+                    }
+
                     FragmentRegisterEntry newEntry;
                     newEntry.seriesId = seriesId;
                     newEntry.channel = channel;
                     newEntry.respectsHol = respectsHol;
+                    newEntry.channelSeq = channelSeq;
                     fragmentationRegister.push(newEntry);
                     entry = &fragmentationRegister[fragmentationRegister.size() - 1];
                 }
                 entry->fragments[fragmentId] = payload;
                 entry->lastUpdated = millis();
-                if (fragState == 1) entry->hasStart = true;
+                if (fragState == 1) {
+                    entry->hasStart = true;
+                    entry->channelSeq = channelSeq;
+                }
                 if (fragState == 3) {
                     entry->hasEnd = true;
                     entry->endFragmentId = fragmentId;
@@ -781,6 +899,7 @@ bool Lines::parse(const String &bundle, u32 band) {
                 if (entry->isComplete()) {
                     String fullPayload = entry->assemble();
                     Packet completePacket(entry->channel, fullPayload, isImportant, entry->respectsHol);
+                    completePacket.channelSeq = entry->channelSeq;
                     for (usz i = 0; i < fragmentationRegister.size(); ++i) {
                         if (fragmentationRegister[i].seriesId == seriesId) {
                             fragmentationRegister.remove(i);
@@ -791,6 +910,7 @@ bool Lines::parse(const String &bundle, u32 band) {
                 }
             } else {
                 Packet p(channel, payload, isImportant, respectsHol);
+                p.channelSeq = channelSeq;
                 dispatchPacket(p, (u32)realBundleId);
             }
         }
@@ -803,20 +923,99 @@ bool Lines::parse(const String &bundle, u32 band) {
 
 void Lines::dispatchPacket(const Packet &packet, u32 seq) {
     (void)seq;
-    if (onPacket) onPacket(packet);
+    if (!packet.respectsHOL) {
+        if (onPacket) onPacket(packet);
+        return;
+    }
+
+    ChannelSeq &cSeq = channelSequences[packet.channel];
+    if (packet.channelSeq == cSeq.nextExpected) {
+        if (onPacket) onPacket(packet);
+        cSeq.nextExpected++;
+
+        while (cSeq.holQueue.has(cSeq.nextExpected)) {
+            Packet nextP = cSeq.holQueue[cSeq.nextExpected];
+            cSeq.holQueue.remove(cSeq.nextExpected);
+            cSeq.nextExpected++;
+            if (onPacket) onPacket(nextP);
+        }
+    } else if (packet.channelSeq > cSeq.nextExpected) {
+        cSeq.holQueue[packet.channelSeq] = packet;
+    }
 }
 
 void Lines::advanceWindow(u64 newBase) {
     if (newBase <= base) return;
     u64 shift = newBase - base;
-    if (shift >= 64) windowBitmap = 0;
-    else windowBitmap >>= shift;
+    windowBitmap.shiftRight(shift);
     base = newBase;
 }
 
 // ---------------------------------------------------------------------------
 // Post-Upgrade Control: SACK Heartbeat & Disconnect
 // ---------------------------------------------------------------------------
+
+Array<FromTo> Lines::showReceived() const {
+    Array<FromTo> intervals;
+    if (base > 2) {
+        intervals.push(FromTo(2, base - 1));
+    }
+
+    u64 currentBit = 0;
+    while (currentBit < size) {
+        if (windowBitmap.test(currentBit)) {
+            u64 spanStart = base + currentBit;
+            while (currentBit < size && windowBitmap.test(currentBit)) {
+                currentBit++;
+            }
+            u64 spanEnd = base + currentBit - 1;
+
+            if (intervals.size() > 0 && intervals[intervals.size() - 1].to + 1 == spanStart) {
+                intervals[intervals.size() - 1].to = spanEnd;
+            } else {
+                intervals.push(FromTo(spanStart, spanEnd));
+            }
+        } else {
+            currentBit++;
+        }
+    }
+    return intervals;
+}
+
+Array<FromTo> Lines::showUnavailableToRetransmit() const {
+    Array<FromTo> intervals;
+    u64 maxBound = (nonce > 0) ? (nonce - 1) : 0;
+
+    Array<u64> availKeys;
+    for (auto &entry : const_cast<Map<u64, String>&>(retransmissionBuffer)) {
+        availKeys.push(entry.key);
+    }
+    for (usz i = 0; i < availKeys.size(); ++i) {
+        for (usz j = i + 1; j < availKeys.size(); ++j) {
+            if (availKeys[j] < availKeys[i]) {
+                u64 tmp = availKeys[i];
+                availKeys[i] = availKeys[j];
+                availKeys[j] = tmp;
+            }
+        }
+    }
+
+    u64 cur = 0;
+    for (usz i = 0; i < availKeys.size(); ++i) {
+        u64 k = availKeys[i];
+        if (k > maxBound) break;
+        if (k > cur) {
+            intervals.push(FromTo(cur, k - 1));
+        }
+        cur = k + 1;
+    }
+
+    if (cur <= maxBound) {
+        intervals.push(FromTo(cur, maxBound));
+    }
+
+    return intervals;
+}
 
 void Lines::handleDisconnect(const String &payload) {
     usz at = 0;
@@ -836,37 +1035,43 @@ void Lines::handleSack(const String &payload) {
 
     u64 numAcked = readVarLong(payload, at);
     for (u64 i = 0; i < numAcked; ++i) {
-        u64 start = readVarLong(payload, at);
-        u64 end = readVarLong(payload, at);
-        for (u64 id = start; id <= end; ++id) {
+        u64 from = readVarLong(payload, at);
+        u64 to = readVarLong(payload, at);
+        for (u64 id = from; id <= to; ++id) {
             retransmissionBuffer.remove(id);
         }
     }
 
     u64 numPretend = readVarLong(payload, at);
     for (u64 i = 0; i < numPretend; ++i) {
-        u64 start = readVarLong(payload, at);
-        u64 end = readVarLong(payload, at);
-        for (u64 id = start; id <= end; ++id) {
+        u64 from = readVarLong(payload, at);
+        u64 to = readVarLong(payload, at);
+        for (u64 id = from; id <= to; ++id) {
             retransmissionBuffer.remove(id);
         }
+        pretendReceived(from, to);
     }
+
+    retransmitFrom = 0;
 }
 
 void Lines::sendSackHeartbeat(u32 targetBand) {
     String payload;
     writeVarLong(payload, 1); // Action 1: SACK Heartbeat
 
-    // Acknowledged range [2, base - 1]
-    if (base > 2) {
-        writeVarLong(payload, 1); // 1 interval
-        writeVarLong(payload, 2);
-        writeVarLong(payload, base - 1);
-    } else {
-        writeVarLong(payload, 0);
+    Array<FromTo> received = showReceived();
+    writeVarLong(payload, (u64)received.size());
+    for (usz i = 0; i < received.size(); ++i) {
+        writeVarLong(payload, received[i].from);
+        writeVarLong(payload, received[i].to);
     }
 
-    writeVarLong(payload, 0); // No pretend intervals
+    Array<FromTo> unavailable = showUnavailableToRetransmit();
+    writeVarLong(payload, (u64)unavailable.size());
+    for (usz i = 0; i < unavailable.size(); ++i) {
+        writeVarLong(payload, unavailable[i].from);
+        writeVarLong(payload, unavailable[i].to);
+    }
 
     Packet p(0, payload, false, false);
     pendingUnimportantQueue.push(p);
@@ -900,10 +1105,59 @@ void Lines::update() {
 
     if (!isUpgraded()) return;
 
-    // Retransmission of unacknowledged bundles
+    // Prune stale fragment register entries (older than timeout or exceeding size)
+    for (usz i = 0; i < fragmentationRegister.size(); ) {
+        if (now - fragmentationRegister[i].lastUpdated > timeout) {
+            fragmentationRegister.remove(i);
+        } else {
+            ++i;
+        }
+    }
+    while (fragmentationRegister.size() > size && fragmentationRegister.size() > 0) {
+        usz oldestIdx = 0;
+        u64 oldestTime = fragmentationRegister[0].lastUpdated;
+        for (usz i = 1; i < fragmentationRegister.size(); ++i) {
+            if (fragmentationRegister[i].lastUpdated < oldestTime) {
+                oldestTime = fragmentationRegister[i].lastUpdated;
+                oldestIdx = i;
+            }
+        }
+        fragmentationRegister.remove(oldestIdx);
+    }
+
+    // Retransmission starting from retransmitFrom in retransmissionBuffer
+    u64 lastRetransmitted = 0;
+    bool anyRetransmitted = false;
+
+    Array<u64> keysToRetransmit;
     for (auto &entry : retransmissionBuffer) {
-        u32 band = selectBestBand(entry.value.size());
-        transmitRaw(entry.value, band);
+        if (retransmitFrom == 0 || entry.key >= retransmitFrom) {
+            keysToRetransmit.push(entry.key);
+        }
+    }
+    for (usz i = 0; i < keysToRetransmit.size(); ++i) {
+        for (usz j = i + 1; j < keysToRetransmit.size(); ++j) {
+            if (keysToRetransmit[j] < keysToRetransmit[i]) {
+                u64 tmp = keysToRetransmit[i];
+                keysToRetransmit[i] = keysToRetransmit[j];
+                keysToRetransmit[j] = tmp;
+            }
+        }
+    }
+
+    for (usz i = 0; i < keysToRetransmit.size(); ++i) {
+        u64 id = keysToRetransmit[i];
+        const String *bundle = retransmissionBuffer.get(id);
+        if (bundle) {
+            u32 band = selectBestBand(bundle->size());
+            transmitRaw(*bundle, band);
+            lastRetransmitted = id;
+            anyRetransmitted = true;
+        }
+    }
+
+    if (anyRetransmitted) {
+        retransmitFrom = lastRetransmitted + 1;
     }
 
     // SACK Heartbeats schedule
