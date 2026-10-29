@@ -24,7 +24,7 @@ It's really bitpacked (the overhead is ~11 bytes), lightweight, supports full en
 
 
 
-Full documentation at [ksee.dev/lines/1-lines](https://ksee.dev/lines/1-line), you could find examples there.
+Full documentation at [ksee.dev/lines/1-lines](https://ksee.dev/lines/1-lines), you could find examples there.
 
 Licenced under the Apache2.0 license.
 
