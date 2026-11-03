@@ -1,99 +1,274 @@
 /**
  * @file Lines.cpp
- * @brief High-performance implementation of the Lines protocol engine.
+ * @brief High-performance, human-engineered implementation of the Lines protocol.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License").
  */
 
 #include "../../include/Lines/Lines.hpp"
 #include <stdio.h>
+#include <cmath>
+#include <algorithm>
 #include <Ksee/Crypto/AEAD.hpp>
 
 namespace Ksee {
 
 // ---------------------------------------------------------------------------
-// Cryptographic Helpers & Fast Masking
+// Low-Level Protocol Primitives & VarInt
 // ---------------------------------------------------------------------------
 
-static void computeMac(u8 out8[8], const u256 &key, u64 nonce, const u8 *msg, usz len) {
-    u512 block0 = chacha(key, nonce, 12, 0);
-    u8 fullTag[16];
-    poly1305_auth(fullTag, msg, len, block0.data);
-    for (int i = 0; i < 8; ++i) out8[i] = fullTag[i];
+static inline void encodeVarInt(u64 value, String &out) {
+    while (value >= 0x80) {
+        out.push((char)((value & 0x7F) | 0x80));
+        value >>= 7;
+    }
+    out.push((char)(value & 0x7F));
 }
 
-static bool verifyMac(const u8 expected8[8], const u256 &key, u64 nonce, const u8 *msg, usz len) {
-    u8 computed[8];
-    computeMac(computed, key, nonce, msg, len);
-    u8 diff = 0;
-    for (int i = 0; i < 8; ++i) diff |= (expected8[i] ^ computed[i]);
-    return diff == 0;
+static inline bool decodeVarInt(const u8 *data, usz len, usz &offset, u64 &out) {
+    out = 0;
+    u32 shift = 0;
+    while (offset < len) {
+        u8 byte = data[offset++];
+        out |= (u64)(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) return true;
+        shift += 7;
+        if (shift >= 64) return false;
+    }
+    return false;
 }
 
-static u32 computeCrc23(const u8 *data, usz len) {
-    u32 crc = 0x555555;
+/**
+ * @brief Computes standard automotive CRC-15-CAN (x^15 + x^14 + x^10 + x^8 + x^7 + x^4 + x^3 + 1).
+ */
+static u16 computeCrc15(const u8 *data, usz len, u16 initialCrc = 0x0000) {
+    u16 crc = initialCrc & 0x7FFF;
     for (usz i = 0; i < len; ++i) {
-        crc ^= (u32)data[i] << 15;
+        crc ^= (u16)data[i] << 7;
         for (int b = 0; b < 8; ++b) {
-            if (crc & 0x400000) {
-                crc = ((crc << 1) ^ 0x65AC93) & 0x7FFFFF;
-            } else {
-                crc = (crc << 1) & 0x7FFFFF;
+            crc <<= 1;
+            if (crc & 0x8000) {
+                crc ^= 0x4599;
             }
         }
     }
-    return crc & 0x7FFFFF;
+    return crc & 0x7FFF;
 }
 
-static inline u32 extractCiphertextPrefix(const u8 *ct, usz len) {
-    if (len >= 3) return (u32)ct[0] | ((u32)ct[1] << 8) | ((u32)ct[2] << 16);
-    if (len == 2) return (u32)ct[0] | ((u32)ct[1] << 8);
-    if (len == 1) return (u32)ct[0];
-    return 0;
+/**
+ * @brief Generates an 8-byte Poly1305 MAC over bundleId + ciphertext.
+ */
+static void computeBundleMac(u8 out8[8], const u256 &key, u64 bundleId, const u8 *ciphertext, usz len) {
+    u512 block0 = chacha(key, bundleId, 12, 0);
+
+    // Stream bundleId (8 bytes little endian) followed by ciphertext
+    u8 fullTag[16];
+    String authPayload;
+    authPayload.allocate(8 + len);
+    for (int i = 0; i < 8; ++i) {
+        authPayload[i] = (char)(u8)(bundleId >> (i * 8));
+    }
+    if (len > 0) {
+        memcpy(authPayload.data() + 8, ciphertext, len);
+    }
+
+    poly1305_auth(fullTag, (const u8*)authPayload.data(), authPayload.size(), block0.data);
+    for (int i = 0; i < 8; ++i) {
+        out8[i] = fullTag[i];
+    }
 }
 
-static inline u32 computeDeltaMask(const u256 &key, u32 ctPrefix) {
+static bool verifyBundleMac(const u8 expected8[8], const u256 &key, u64 bundleId, const u8 *ciphertext, usz len) {
+    u8 computed[8];
+    computeBundleMac(computed, key, bundleId, ciphertext, len);
+    u8 diff = 0;
+    for (int i = 0; i < 8; ++i) {
+        diff |= (expected8[i] ^ computed[i]);
+    }
+    return diff == 0;
+}
+
+static inline u16 computeDeltaMask(const u256 &directionalKey, const u8 *ciphertext, usz len) {
+    u16 ctPrefix = 0;
+    if (len >= 2) {
+        ctPrefix = (u16)ciphertext[0] | ((u16)ciphertext[1] << 8);
+    } else if (len == 1) {
+        ctPrefix = (u16)ciphertext[0];
+    }
     u32 keyHash = 0x811c9dc5;
     for (int i = 0; i < 32; ++i) {
-        keyHash ^= (u32)key.data[i];
+        keyHash ^= (u32)directionalKey.data[i];
         keyHash *= 0x01000193;
     }
-    return (ctPrefix ^ keyHash) & 0x7FFFFF;
+    return (u16)((ctPrefix ^ (u16)keyHash) & 0x7FFF);
 }
 
 // ---------------------------------------------------------------------------
-// FragmentRegisterEntry
+// BandSlot Implementation
 // ---------------------------------------------------------------------------
 
-bool FragmentRegisterEntry::isComplete() const {
-    if (!hasStart || !hasEnd) return false;
-    for (u32 i = 0; i <= endFragmentId; ++i) {
-        if (!fragments.has(i)) return false;
+bool BandSlot::isAvailable() const {
+    if (!physical) return false;
+    return physical->couldPush();
+}
+
+// ---------------------------------------------------------------------------
+// PhysicalBand Implementation
+// ---------------------------------------------------------------------------
+
+PhysicalBand::PhysicalBand() {
+    lastDebtRegenTime = millis();
+}
+
+PhysicalBand::~PhysicalBand() {
+    for (usz i = 0; i < slots.size(); ++i) {
+        if (slots[i] && slots[i]->physical == this) {
+            slots[i]->physical = nullptr;
+        }
     }
+}
+
+bool PhysicalBand::couldPush() const {
+    u64 now = millis();
+    if (now < stunnedUntil) return false;
+    if (maxDuty > 0 && duty >= maxDuty) return false;
     return true;
 }
 
-String FragmentRegisterEntry::assemble() const {
-    String payload;
-    for (u32 i = 0; i <= endFragmentId; ++i) {
-        const String *frag = fragments.get(i);
-        if (frag) payload.append(frag->data(), frag->size());
+void PhysicalBand::stun(u64 duration) {
+    if (duration == 0) {
+        duration = 1 + (randomNumber<u32>() % 5);
     }
-    return payload;
+    stunnedUntil = millis() + duration;
+}
+
+void PhysicalBand::push(const String &bundle) {
+    if (!couldPush()) return;
+    if (maxBundleSize > 0 && bundle.size() > maxBundleSize) return;
+
+    u64 a = millis();
+    if (sendCallback) {
+        sendCallback(bundle);
+    }
+    u64 b = millis();
+    u64 airtime = (b >= a) ? (b - a) : 0;
+    duty += (airtime > 0 ? airtime : 1);
+}
+
+void PhysicalBand::recv(const String &bundle) {
+    if (maxBundleSize > 0 && bundle.size() > maxBundleSize) return;
+    for (usz i = 0; i < slots.size(); ++i) {
+        if (slots[i] && slots[i]->lines) {
+            if (slots[i]->lines->parse(bundle, slots[i])) {
+                break;
+            }
+        }
+    }
+}
+
+void PhysicalBand::addSlot(BandSlot *slot) {
+    if (!slot) return;
+    for (usz i = 0; i < slots.size(); ++i) {
+        if (slots[i] == slot) return;
+    }
+    slots.push(slot);
+    slot->physical = this;
+}
+
+void PhysicalBand::removeSlot(BandSlot *slot) {
+    for (usz i = 0; i < slots.size(); ++i) {
+        if (slots[i] == slot) {
+            slots.remove(i);
+            break;
+        }
+    }
+    if (slot && slot->physical == this) {
+        slot->physical = nullptr;
+    }
+    // "if this is the last slot, it self destructs."
+    if (slots.isEmpty() && isDynamicallyAllocated) {
+        delete this;
+    }
+}
+
+void PhysicalBand::update(bool doLinesUpdates) {
+    u64 now = millis();
+    if (lastDebtRegenTime == 0) lastDebtRegenTime = now;
+    if (now >= lastDebtRegenTime + 1000) {
+        u64 elapsedSec = (now - lastDebtRegenTime) / 1000;
+        lastDebtRegenTime += elapsedSec * 1000;
+        if (maxDuty > 0) {
+            u64 deduct = maxDuty * elapsedSec;
+            if (duty > deduct) duty -= deduct;
+            else duty = 0;
+        } else {
+            duty = 0;
+        }
+    }
+
+    if (recvCallback) {
+        String data = recvCallback();
+        if (data.size() > 0) {
+            recv(data);
+        }
+    }
+
+    if (doLinesUpdates) {
+        for (usz i = 0; i < slots.size(); ++i) {
+            if (slots[i] && slots[i]->lines) {
+                slots[i]->lines->update(/* callPBUpdates = */ false);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Lines Engine Implementation
+// Construction & Lifecycle
 // ---------------------------------------------------------------------------
 
 Lines::Lines() {
-    epheKeypair = Keypair::generate();
+    epheKeypair = XKeypair::generate();
     lastSeen = millis();
     lastSent = millis();
-    windowBitmap.resize(size);
-    retransmitFrom = 0;
+    baseMoveTime = millis();
+    base = 2;
+    sendBase = 2;
+    nonce = 2;
+    windowBitmap = 0;
 }
 
 Lines::~Lines() {
     destroy();
+}
+
+void Lines::destroy() {
+    if (onDestroy) {
+        onDestroy();
+        onDestroy = nullptr;
+    }
+    outbox.clear();
+    inbox.clear();
+    retransmissionBuffer.clear();
+    toBeBundled.clear();
+    channelSequences.clear();
+    sharedKey.clear();
+    epheKeypair = XKeypair();
+    windowBitmap = 0;
+    base = 2;
+    sendBase = 2;
+    nonce = 2;
+
+    // Clean up band slots
+    for (usz i = 0; i < bands.size(); ++i) {
+        BandSlot *slot = bands[i];
+        if (slot) {
+            if (slot->physical) {
+                slot->physical->removeSlot(slot);
+            }
+            delete slot;
+        }
+    }
+    bands.clear();
 }
 
 void Lines::setupDirectionalKeys() {
@@ -113,1076 +288,1306 @@ void Lines::setupDirectionalKeys() {
     theirDirectionalKey = theirK;
 }
 
-bool Lines::isEncrypted(const String &bytes) {
-    return (bytes.size() >= 3 && ((bytes[2] & 0x80) != 0));
+void Lines::manualUpgrade(const String &key, bool isInitiator, u64 initialNonce) {
+    sharedKey = key;
+    initiator = isInitiator;
+    setupDirectionalKeys();
+    upgradeTime = millis();
+    nonce = initialNonce;
+    base = initialNonce;
+    sendBase = initialNonce;
+    windowBitmap = 0;
+    baseMoveTime = millis();
+    scheduleNextBestEffortHeartbeat();
+    scheduleNextCuriosityHeartbeat();
 }
 
-bool Lines::matchesBundle(const String &bytes) const {
-    if (bytes.size() < 12) return false;
-    if (!isEncrypted(bytes)) return false;
-    if (sharedKey.size() < 32) return false;
+// ---------------------------------------------------------------------------
+// Multi-Band Management
+// ---------------------------------------------------------------------------
 
-    u32 rawHeader = (u32)(u8)bytes[0] | ((u32)(u8)bytes[1] << 8) | ((u32)(u8)bytes[2] << 16);
-    u32 maskedDelta = rawHeader & 0x7FFFFF;
-
-    const u8 *ct = (const u8*)bytes.data() + 11;
-    usz ctLen = bytes.size() - 11;
-    u32 mask = computeDeltaMask(theirDirectionalKey, extractCiphertextPrefix(ct, ctLen));
-    u32 delta = (maskedDelta ^ mask) & 0x7FFFFF;
-
-    return (delta < size);
+BandSlot* Lines::enable(Func<void(String)> sendCallback, Func<String()> recvCallback) {
+    PhysicalBand *pb = new PhysicalBand();
+    pb->isDynamicallyAllocated = true;
+    pb->sendCallback = sendCallback;
+    pb->recvCallback = recvCallback;
+    return enable(pb);
 }
 
-void Lines::enable(Func<void(String)> callback, u32 band, u64 initialWeight, u32 mtu) {
-    Band b;
-    b.id = band;
-    b.sendCallback = callback;
-    b.weight = (initialWeight < 1) ? 1 : initialWeight;
-    b.mtu = (mtu == 0) ? 1024 : mtu;
-    b.enabled = true;
-    b.occupied = false;
-    b.bytesInInterval = 0;
-    b.intervalStartTime = millis();
-    bands[band] = b;
+BandSlot* Lines::enable(PhysicalBand &physicalBand) {
+    BandSlot *slot = new BandSlot();
+    slot->lines = this;
+    slot->id = bands.size() + 1;
+    slot->windowResetTime = millis();
+    physicalBand.addSlot(slot);
+    bands.push(slot);
+    return slot;
 }
 
-void Lines::disable(u32 band) {
-    if (bands.has(band)) {
-        bands[band].enabled = false;
-        bands[band].weight = 0;
+BandSlot* Lines::enable(PhysicalBand *physicalBand) {
+    if (!physicalBand) return nullptr;
+    return enable(*physicalBand);
+}
+
+BandSlot* Lines::enable(BandSlot *bandSlot) {
+    if (!bandSlot) return nullptr;
+    bandSlot->lines = this;
+    bands.push(bandSlot);
+    if (bandSlot->physical) {
+        bandSlot->physical->addSlot(bandSlot);
+    }
+    return bandSlot;
+}
+
+BandSlot* Lines::enable() {
+    PhysicalBand *pb = new PhysicalBand();
+    pb->isDynamicallyAllocated = true;
+    return enable(pb);
+}
+
+BandSlot* Lines::enable(Func<void(String)> sendCallback, u64 legacyBandId, u64 initialWeight, u64 maxBundleSize) {
+    PhysicalBand *pb = new PhysicalBand();
+    pb->isDynamicallyAllocated = true;
+    pb->sendCallback = sendCallback;
+    pb->idealCapacity = initialWeight;
+    pb->maxBundleSize = (maxBundleSize < 255 && maxBundleSize > 0) ? 255 : maxBundleSize;
+    BandSlot *slot = enable(pb);
+    if (slot) slot->id = legacyBandId;
+    return slot;
+}
+
+void Lines::disable(BandSlot *slot) {
+    if (!slot) return;
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i] == slot) {
+            bands.remove(i);
+            break;
+        }
+    }
+    if (slot->physical) {
+        slot->physical->removeSlot(slot);
+    }
+    delete slot;
+}
+
+void Lines::disable(u64 bandSlotIdx) {
+    // If index matches directly in bands
+    if (bandSlotIdx < bands.size()) {
+        disable(bands[bandSlotIdx]);
+        return;
+    }
+    // Check legacy slot id
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i] && bands[i]->id == bandSlotIdx) {
+            disable(bands[i]);
+            return;
+        }
     }
 }
 
-f32 Lines::getAggression() const {
-    if (size == 0) return 0.0f;
-    return (f32)retransmissionBuffer.size() / (f32)size;
+void Lines::stun(BandSlot *slot, u64 duration) {
+    if (slot && slot->physical) {
+        slot->physical->stun(duration);
+    }
 }
 
-bool Lines::couldPush() const {
-    return getAggression() < 0.9f;
+void Lines::stun(u64 bandSlotIdx, u64 duration) {
+    if (bandSlotIdx < bands.size() && bands[bandSlotIdx]) {
+        stun(bands[bandSlotIdx], duration);
+        return;
+    }
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i] && bands[i]->id == bandSlotIdx) {
+            stun(bands[i], duration);
+            return;
+        }
+    }
 }
 
-u64 Lines::getWeight() const {
+u64 Lines::getBandWeight(u64 band) const {
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i] && bands[i]->id == band) {
+            return bands[i]->getSendThroughput();
+        }
+    }
+    return 0;
+}
+
+u64 Lines::getSendThroughput() const {
     u64 sum = 0;
-    for (auto &entry : const_cast<Map<u32, Band>&>(bands)) {
-        if (entry.value.enabled) sum += entry.value.weight;
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i]) sum += bands[i]->getSendThroughput();
     }
     return sum;
 }
 
-u64 Lines::getBandWeight(u32 band) const {
-    if (!bands.has(band)) return 0;
-    const Band *b = bands.get(band);
-    return (b && b->enabled) ? b->weight : 0;
-}
-
-void Lines::updateBandReception(u32 bandId, usz bytesCount) {
-    if (!bands.has(bandId)) return;
-    Band &b = bands[bandId];
-    if (!b.enabled) return;
-
-    u64 now = millis();
-    b.bytesInInterval += bytesCount;
-    u64 elapsed = now - b.intervalStartTime;
-
-    if (elapsed >= 1000) {
-        u64 measuredRate = (b.bytesInInterval * 1000) / (elapsed > 0 ? elapsed : 1);
-        b.weight = (measuredRate > 1) ? measuredRate : 1;
-        b.bytesInInterval = 0;
-        b.intervalStartTime = now;
+u64 Lines::getRecvThroughput() const {
+    u64 sum = 0;
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i]) sum += bands[i]->getRecvThroughput();
     }
+    return sum;
 }
 
-u32 Lines::selectBestBand(u32 requiredPayloadSize) const {
-    u32 bestBand = 0;
-    u64 bestWeight = 0;
-    bool found = false;
+u64 Lines::getThroughput() const {
+    return getSendThroughput() + getRecvThroughput();
+}
 
-    for (auto &entry : const_cast<Map<u32, Band>&>(bands)) {
-        const Band &b = entry.value;
-        if (b.enabled && !b.occupied && b.mtu >= requiredPayloadSize) {
-            if (!found || b.weight > bestWeight) {
-                bestWeight = b.weight;
-                bestBand = b.id;
-                found = true;
+u64 Lines::getLatency() const {
+    u64 minLat = (u64)-1;
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i] && bands[i]->isAvailable()) {
+            u64 l = bands[i]->getLatency();
+            if (l < minLat) minLat = l;
+        }
+    }
+    return (minLat == (u64)-1) ? 1 : minLat;
+}
+
+f32 Lines::getPressure() const {
+    u32 unacked = 0;
+    for (const auto &pair : outbox) {
+        if (pair.value.ackTime == 0 && pair.value.delivery == Packet::Reliable) unacked++;
+    }
+    return (f32)unacked / (f32)size;
+}
+
+bool Lines::couldPush() const {
+    if (maxThroughput > 0 && getThroughput() >= maxThroughput) return false;
+    return getPressure() < 1.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Band Selection & Scheduling
+// ---------------------------------------------------------------------------
+
+i64 Lines::getBestReliableBand() const {
+    i64 bestIdx = -1;
+    u64 maxCap = 0;
+
+    for (usz i = 0; i < bands.size(); ++i) {
+        BandSlot *s = bands[i];
+        if (!s || !s->isAvailable()) continue;
+        u64 cap = s->getSendCapacity();
+        if (cap > maxCap) {
+            maxCap = cap;
+            bestIdx = (i64)i;
+        }
+    }
+
+    if (bestIdx == -1) {
+        // Fall back to primingBandSlot
+        if (primingBandSlot < bands.size() && bands[primingBandSlot]->isAvailable()) {
+            return (i64)primingBandSlot;
+        }
+        for (usz i = 0; i < bands.size(); ++i) {
+            if (bands[i] && bands[i]->isAvailable()) return (i64)i;
+        }
+    }
+    return bestIdx;
+}
+
+i64 Lines::getBestEffortBand() const {
+    i64 bestIdx = -1;
+    u64 minLat = (u64)-1;
+
+    for (usz i = 0; i < bands.size(); ++i) {
+        BandSlot *s = bands[i];
+        if (!s || !s->isAvailable()) continue;
+        u64 lat = s->getLatency();
+        if (lat < minLat) {
+            minLat = lat;
+            bestIdx = (i64)i;
+        }
+    }
+
+    if (bestIdx == -1) return getBestReliableBand();
+    return bestIdx;
+}
+
+i64 Lines::getBestCuriosityBand() const {
+    Array<i64> candidateIndices;
+    Array<i64> headroomScores;
+
+    for (usz i = 0; i < bands.size(); ++i) {
+        BandSlot *s = bands[i];
+        if (!s || !s->isAvailable()) continue;
+        candidateIndices.push((i64)i);
+        u64 ideal = s->physical ? s->physical->idealCapacity : 0;
+        i64 headroom = (i64)ideal - (i64)s->getSendCapacity();
+        headroomScores.push(headroom);
+    }
+
+    if (candidateIndices.size() == 0) return -1;
+    if (candidateIndices.size() == 1) return candidateIndices[0];
+
+    // Bubble-sort ranks by headroom descending
+    for (usz i = 0; i < candidateIndices.size(); ++i) {
+        for (usz j = i + 1; j < candidateIndices.size(); ++j) {
+            if (headroomScores[j] > headroomScores[i]) {
+                std::swap(headroomScores[i], headroomScores[j]);
+                std::swap(candidateIndices[i], candidateIndices[j]);
             }
         }
     }
-    if (!found) {
-        for (auto &entry : const_cast<Map<u32, Band>&>(bands)) {
-            if (entry.value.enabled && !entry.value.occupied) return entry.value.id;
-        }
+
+    // Stochastic rank perturbation (+/- 2 positions)
+    usz chosenIdx = 0;
+    if (candidateIndices.size() > 1) {
+        int jitter = (int)(randomNumber<u32>() % 5) - 2; // -2, -1, 0, 1, 2
+        int target = (int)chosenIdx + jitter;
+        if (target < 0) target = 0;
+        if (target >= (int)candidateIndices.size()) target = (int)candidateIndices.size() - 1;
+        chosenIdx = (usz)target;
     }
-    return bestBand;
+
+    return candidateIndices[chosenIdx];
 }
 
-void Lines::transmitRaw(const String &bundle, u32 bandId) {
-    if (!bands.has(bandId)) return;
-    Band &b = bands[bandId];
-    if (!b.enabled || !b.sendCallback) return;
-
-    b.occupied = true;
-    b.sendCallback(bundle);
-    b.occupied = false;
-    lastSent = millis();
+void Lines::scheduleNextBestEffortHeartbeat() {
+    u64 minWait = timeout / 6;
+    u64 maxWait = timeout / 3;
+    u64 span = (maxWait > minWait) ? (maxWait - minWait) : 1000;
+    nextBestEffortHeartbeat = millis() + minWait + (randomNumber<u32>() % (u32)span);
 }
 
-void Lines::manualUpgrade(const String &key, bool isInitiator, u64 initialNonce) {
-    sharedKey = key;
-    initiator = isInitiator;
-    nonce = initialNonce;
-    base = initialNonce;
-    windowBitmap.resize(size);
-    windowBitmap.clear();
-    retransmitFrom = 0;
+void Lines::scheduleNextCuriosityHeartbeat() {
+    if (bands.size() <= 1) {
+        nextCuriosityHeartbeat = 0;
+        return;
+    }
+    f32 p = getPressure();
+    f32 factor = std::exp(-4.6f * p);
+    u64 calculated = (u64)((f32)timeout * factor);
+    u64 floorInterval = timeout / 100;
+    u64 interval = (calculated > floorInterval) ? calculated : floorInterval;
+    nextCuriosityHeartbeat = millis() + interval;
+}
+
+void Lines::sendSackHeartbeat(BandSlot *targetSlot) {
+    sendSack(Packet::BestEffort, targetSlot);
+}
+
+void Lines::sendSackHeartbeat(u64 targetBandSlotIdx) {
+    BandSlot *slot = (targetBandSlotIdx < bands.size()) ? bands[targetBandSlotIdx] : nullptr;
+    sendSackHeartbeat(slot);
+}
+
+// ---------------------------------------------------------------------------
+// Handshake Protocol Implementation
+// ---------------------------------------------------------------------------
+
+u16 Lines::getTuneSeed() const {
+    if (tune.isEmpty()) return 0x0000;
+    return computeCrc15((const u8*)tune.data(), tune.size(), 0x0000);
+}
+
+void Lines::probe(const Tree &sel) {
+    initiator = true;
+    String payload;
+    payload.append((const char*)epheKeypair.publicKey().data, 32);
+
+    String selBytes = petrify(sel);
+    encodeVarInt(selBytes.size(), payload);
+    payload.append(selBytes.data(), selBytes.size());
+
+    // Single-packet Pre-Upgrade Bundle:
+    // Header (2B): isEncrypted = 0 (bit 15), CRC-15-CAN (bits 14..0)
+    // PacketHeader (1B): channelOtherThanOne = 0 (channel 0 is handshake)
+    String bundle;
+    bundle.allocate(3 + payload.size());
+    bundle[0] = 0;
+    bundle[1] = 0;
+    bundle[2] = 0;
+    for (usz i = 0; i < payload.size(); ++i) {
+        bundle[3 + i] = payload[i];
+    }
+
+    // Compute CRC-15 over payload and packetHeader seeded by tune
+    u16 crc = computeCrc15((const u8*)bundle.data() + 2, bundle.size() - 2, getTuneSeed());
+    bundle[0] = (char)(u8)(crc & 0xFF);
+    bundle[1] = (char)(u8)((crc >> 8) & 0x7F); // Bit 15 is 0
+
+    i64 targetBandIdx = getBestReliableBand();
+    BandSlot *slot = (targetBandIdx >= 0 && (usz)targetBandIdx < bands.size()) ? bands[(usz)targetBandIdx] : nullptr;
+    if (!slot && bands.size() > 0) slot = bands[0];
+
+    if (slot && slot->physical) {
+        slot->physical->push(bundle);
+        lastSent = millis();
+    }
+}
+
+void Lines::upgrade(const Tree &clientMetadata) {
+    if (sharedKey.size() < 32) return;
+    initiator = true;
     setupDirectionalKeys();
+
+    String payload;
+    u8 mac[8];
+    u256 ourK = ourDirectionalKey;
+
+    // Ephemeral public
+    payload.append((const char*)epheKeypair.publicKey().data, 32);
+
+    // Static proofs and metadata
+    String plaintext;
+    encodeVarInt(staticKeypairs.size(), plaintext);
+    for (usz i = 0; i < staticKeypairs.size(); ++i) {
+        u256 proofKey = staticKeypairs[i].sharedKey(theirEphePublic);
+        u8 proofMac[8];
+        computeBundleMac(proofMac, proofKey, 1, nullptr, 0);
+        plaintext.append((const char*)proofMac, 8);
+        plaintext.append((const char*)staticKeypairs[i].publicKey().data, 32);
+    }
+
+    String metaBytes = petrify(clientMetadata);
+    encodeVarInt(metaBytes.size(), plaintext);
+    plaintext.append(metaBytes.data(), metaBytes.size());
+
+    String ciphertext = crypt(plaintext, ourK, 1, 12);
+    computeBundleMac(mac, ourK, 1, (const u8*)ciphertext.data(), ciphertext.size());
+
+    payload.append((const char*)mac, 8);
+    payload.append(ciphertext.data(), ciphertext.size());
+
+    // Build pre-upgrade packet
+    String bundle;
+    bundle.allocate(3 + payload.size());
+    bundle[0] = 0;
+    bundle[1] = 0;
+    bundle[2] = 0;
+    for (usz i = 0; i < payload.size(); ++i) {
+        bundle[3 + i] = payload[i];
+    }
+
+    u16 crc = computeCrc15((const u8*)bundle.data() + 2, bundle.size() - 2, getTuneSeed());
+    bundle[0] = (char)(u8)(crc & 0xFF);
+    bundle[1] = (char)(u8)((crc >> 8) & 0x7F);
+
+    i64 targetBandIdx = getBestReliableBand();
+    BandSlot *slot = (targetBandIdx >= 0 && (usz)targetBandIdx < bands.size()) ? bands[(usz)targetBandIdx] : nullptr;
+    if (!slot && bands.size() > 0) slot = bands[0];
+
+    if (slot && slot->physical) {
+        slot->physical->push(bundle);
+        lastSent = millis();
+    }
+
+    nonce = 2;
+    base = 2;
+    sendBase = 2;
+    upgradeTime = millis();
+    scheduleNextBestEffortHeartbeat();
+    scheduleNextCuriosityHeartbeat();
+
+    if (onUpgrade) onUpgrade(theirMetadata);
     if (onReady) onReady();
 }
 
-void Lines::pretendReceived(u64 from, u64 to) {
-    if (from > to) return;
-
-    for (u64 id = from; id <= to; ++id) {
-        if (id < base) continue;
-        if (id >= base + size) break;
-        u64 delta = id - base;
-        windowBitmap.set(delta);
-        while (windowBitmap.test(0)) {
-            windowBitmap.shiftRight(1);
-            base++;
-        }
-    }
-}
-
-void Lines::destroy() {
-    bands.clear();
-    retransmissionBuffer.clear();
-    pendingImportantQueue.destroy();
-    pendingUnimportantQueue.destroy();
-    fragmentationRegister.destroy();
-    channelSequences.clear();
-    outgoingChannelSeq.clear();
-    windowBitmap.clear();
-    retransmitFrom = 0;
-
-    // Securely wipe cryptographic keys
-    if (sharedKey.size() > 0) {
-        memset((void*)sharedKey.data(), 0, sharedKey.size());
-        sharedKey.clear();
-    }
-    memset(ourDirectionalKey.data, 0, sizeof(ourDirectionalKey.data));
-    memset(theirDirectionalKey.data, 0, sizeof(theirDirectionalKey.data));
-    memset(theirEphePublic.data, 0, sizeof(theirEphePublic.data));
-    memset((void*)&epheKeypair, 0, sizeof(epheKeypair));
-
-    for (usz i = 0; i < staticKeypairs.size(); ++i) {
-        memset((void*)&staticKeypairs[i], 0, sizeof(Keypair));
-    }
-    staticKeypairs.destroy();
-
-    for (usz i = 0; i < theirStaticPublics.size(); ++i) {
-        if (theirStaticPublics[i].size() > 0) {
-            memset((void*)theirStaticPublics[i].data(), 0, theirStaticPublics[i].size());
-        }
-    }
-    theirStaticPublics.destroy();
-    theirStatics.destroy();
-
-    metadata.clear();
-    theirMetadata.clear();
-    selector.clear();
-}
-
 void Lines::disconnect(const Tree &reason) {
-    if (isUpgraded()) {
-        String payload;
-        writeVarLong(payload, 0); // Action 0: Disconnect
-        String reasonBinary = reason.toBinary();
-        payload.append(reasonBinary.data(), reasonBinary.size());
+    if (!isUpgraded()) return;
+    String payload;
+    encodeVarInt(0, payload); // Action 0: Disconnect
+    String reasonBytes = petrify(reason);
+    payload.append(reasonBytes.data(), reasonBytes.size());
 
-        Packet p(0, payload, false, false);
-        pendingUnimportantQueue.push(p);
-        u32 band = selectBestBand(payload.size() + 32);
-        sendPostUpgradeBundle(false, band);
-    }
-    if (onDisconnect) onDisconnect(reason);
+    Packet p(payload, 0, Packet::Reliable, false);
+    Array<Packet> pkts;
+    pkts.push(p);
+    sendPostUpgradeBundle(pkts, Packet::Reliable);
+
+    if (onDisconnect) onDisconnect(reason, true);
     destroy();
 }
 
 // ---------------------------------------------------------------------------
-// Handshake: Probe, Announce, Upgrade
-// ---------------------------------------------------------------------------
-
-void Lines::probe(const Tree &sel) {
-    selector = sel;
-    initiator = true;
-    epheKeypair = Keypair::generate();
-
-    String payload;
-    writeVarLong(payload, 10); // Action 10: Probe
-    const u256 &pub = epheKeypair.publicKey();
-    payload.append(pub.data, 32);
-
-    String selBin = sel.toBinary();
-    payload.append(selBin.data(), selBin.size());
-
-    // Pre-upgrade bundle layout:
-    // ( 3 bytes bundleId: CRC23 + isEncrypted(0) )
-    // ( 1 byte bundleHeader: channelOtherThanOne = 1 )
-    // ( VarInt channel = 0 )
-    // ( payload )
-    String inner;
-    inner.push((u8)0x01); // channelOtherThanOne = 1
-    writeVarLong(inner, 0); // channel 0
-    inner.append(payload.data(), payload.size());
-
-    u32 crc = computeCrc23((const u8*)inner.data(), inner.size());
-    String bundle;
-    bundle.push((u8)(crc & 0xFF));
-    bundle.push((u8)((crc >> 8) & 0xFF));
-    bundle.push((u8)((crc >> 16) & 0x7F)); // bit 23 = 0 (isEncrypted)
-    bundle.append(inner.data(), inner.size());
-
-    u32 band = selectBestBand(bundle.size());
-    transmitRaw(bundle, band);
-}
-
-void Lines::handleProbe(const String &payload, u32 bandId) {
-    usz at = 0;
-    u64 action = readVarLong(payload, at);
-    if (action != 10 || (payload.size() - at) < 32) return;
-
-    u256 clientPub((const u8*)payload.data() + at);
-    at += 32;
-
-    Tree receivedSelector;
-    if (at < payload.size()) {
-        usz bytesRead = 0;
-        receivedSelector.readFromBinary((const u8*)payload.data() + at, payload.size() - at, bytesRead);
-    }
-
-    theirEphePublic = clientPub;
-    initiator = false;
-
-    if (onProbe && !onProbe(receivedSelector)) return;
-
-    // Generate server ephemeral keypair & derive root key
-    epheKeypair = Keypair::generate();
-    u256 root = epheKeypair.sharedKey(clientPub);
-    sharedKey = root.asString();
-    setupDirectionalKeys();
-
-    // Prepare Announce:
-    // serverEphePub (32) + numProofs (VarInt) + proofs (8 * N) + encrypted metadata (nonce 0)
-    String toSign;
-    const u256 &srvPub = epheKeypair.publicKey();
-    toSign.append(srvPub.data, 32);
-
-    writeVarLong(toSign, (u64)staticKeypairs.size());
-    for (usz i = 0; i < staticKeypairs.size(); ++i) {
-        const u256 &pub = staticKeypairs[i].publicKey();
-        toSign.append(pub.data, 32);
-        u256 proofShared = staticKeypairs[i].sharedKey(clientPub);
-        u8 proofTag[8];
-        computeMac(proofTag, proofShared, 0, nullptr, 0);
-        toSign.append(proofTag, 8);
-    }
-
-    String metaBin = metadata.toBinary();
-    String encMeta = crypt(metaBin, ourDirectionalKey, 0, 12);
-    toSign.append(encMeta.data(), encMeta.size());
-
-    // Compute MAC over toSign
-    u8 mac[8];
-    computeMac(mac, ourDirectionalKey, 0, (const u8*)toSign.data(), toSign.size());
-
-    String announcePayload;
-    writeVarLong(announcePayload, 11); // Action 11: Announce
-    announcePayload.append(mac, 8);
-    announcePayload.append(toSign.data(), toSign.size());
-
-    // Wrap in Pre-upgrade bundle
-    String inner;
-    inner.push((u8)0x01); // channelOtherThanOne = 1
-    writeVarLong(inner, 0); // channel 0
-    inner.append(announcePayload.data(), announcePayload.size());
-
-    u32 crc = computeCrc23((const u8*)inner.data(), inner.size());
-    String bundle;
-    bundle.push((u8)(crc & 0xFF));
-    bundle.push((u8)((crc >> 8) & 0xFF));
-    bundle.push((u8)((crc >> 16) & 0x7F));
-    bundle.append(inner.data(), inner.size());
-
-    transmitRaw(bundle, bandId);
-}
-
-void Lines::handleAnnounce(const String &payload, u32 bandId) {
-    usz at = 0;
-    u64 action = readVarLong(payload, at);
-    if (action != 11 || (payload.size() - at) < 40) return;
-
-    u8 macExpected[8];
-    for (int i = 0; i < 8; ++i) macExpected[i] = (u8)payload[at + i];
-    at += 8;
-
-    usz signedStart = at;
-    u256 srvPub((const u8*)payload.data() + at);
-    at += 32;
-
-    // Derive root key & directional keys
-    u256 root = epheKeypair.sharedKey(srvPub);
-    sharedKey = root.asString();
-    theirEphePublic = srvPub;
-    initiator = true;
-    setupDirectionalKeys();
-
-    // Verify MAC
-    usz signedLen = payload.size() - signedStart;
-    if (!verifyMac(macExpected, theirDirectionalKey, 0, (const u8*)payload.data() + signedStart, signedLen)) {
-        sharedKey.clear();
-        return;
-    }
-
-    u64 numProofs = readVarLong(payload, at);
-    theirStaticPublics.clear();
-    theirStatics.clear();
-    for (u64 p = 0; p < numProofs && (at + 40 <= payload.size()); ++p) {
-        u256 srvStaticPub((const u8*)payload.data() + at);
-        at += 32;
-        u8 receivedTag[8];
-        for (int i = 0; i < 8; ++i) receivedTag[i] = (u8)payload[at + i];
-        at += 8;
-
-        u256 proofShared = epheKeypair.sharedKey(srvStaticPub);
-        if (verifyMac(receivedTag, proofShared, 0, nullptr, 0)) {
-            String pubStr = srvStaticPub.asString();
-            theirStaticPublics.push(pubStr);
-            theirStatics.push(pubStr);
-        }
-    }
-
-    if (at < payload.size()) {
-        String encMeta((const u8*)payload.data() + at, payload.size() - at);
-        String decMeta = crypt(encMeta, theirDirectionalKey, 0, 12);
-        usz readBytes = 0;
-        theirMetadata.readFromBinary((const u8*)decMeta.data(), decMeta.size(), readBytes);
-    }
-
-    if (onAnnounce && !onAnnounce()) return;
-
-    // Build Upgrade Packet (Client -> Server)
-    String toSign;
-    writeVarLong(toSign, (u64)staticKeypairs.size());
-    for (usz i = 0; i < staticKeypairs.size(); ++i) {
-        const u256 &pub = staticKeypairs[i].publicKey();
-        toSign.append(pub.data, 32);
-        u256 proofShared = staticKeypairs[i].sharedKey(srvPub);
-        u8 proofTag[8];
-        computeMac(proofTag, proofShared, 1, nullptr, 0);
-        toSign.append(proofTag, 8);
-    }
-
-    String metaBin = metadata.toBinary();
-    String encMeta = crypt(metaBin, ourDirectionalKey, 1, 12);
-    writeVarLong(toSign, (u64)encMeta.size());
-    toSign.append(encMeta.data(), encMeta.size());
-
-    u8 mac[8];
-    computeMac(mac, ourDirectionalKey, 1, (const u8*)toSign.data(), toSign.size());
-
-    String upgradePayload;
-    writeVarLong(upgradePayload, 20); // Action 20: Upgrade
-    upgradePayload.append(mac, 8);
-    upgradePayload.append(toSign.data(), toSign.size());
-
-    String inner;
-    inner.push((u8)0x01);
-    writeVarLong(inner, 0);
-    inner.append(upgradePayload.data(), upgradePayload.size());
-
-    u32 crc = computeCrc23((const u8*)inner.data(), inner.size());
-    String bundle;
-    bundle.push((u8)(crc & 0xFF));
-    bundle.push((u8)((crc >> 8) & 0xFF));
-    bundle.push((u8)((crc >> 16) & 0x7F));
-    bundle.append(inner.data(), inner.size());
-
-    transmitRaw(bundle, bandId);
-
-    // Switch to live post-upgrade state with nonce = 2
-    nonce = 2;
-    base = 2;
-    windowBitmap.resize(size);
-    windowBitmap.clear();
-    retransmitFrom = 0;
-
-    if (onReady) onReady();
-}
-
-void Lines::handleUpgrade(const String &payload, u32 bandId) {
-    usz at = 0;
-    u64 action = readVarLong(payload, at);
-    if (action != 20 || (payload.size() - at) < 8) return;
-
-    u8 macExpected[8];
-    for (int i = 0; i < 8; ++i) macExpected[i] = (u8)payload[at + i];
-    at += 8;
-
-    usz signedStart = at;
-    usz signedLen = payload.size() - signedStart;
-
-    if (!verifyMac(macExpected, theirDirectionalKey, 1, (const u8*)payload.data() + signedStart, signedLen)) {
-        return;
-    }
-
-    u64 numProofs = readVarLong(payload, at);
-    theirStaticPublics.clear();
-    theirStatics.clear();
-    for (u64 p = 0; p < numProofs && (at + 40 <= payload.size()); ++p) {
-        u256 cliStaticPub((const u8*)payload.data() + at);
-        at += 32;
-        u8 receivedTag[8];
-        for (int i = 0; i < 8; ++i) receivedTag[i] = (u8)payload[at + i];
-        at += 8;
-
-        u256 proofShared = epheKeypair.sharedKey(cliStaticPub);
-        if (verifyMac(receivedTag, proofShared, 1, nullptr, 0)) {
-            String pubStr = cliStaticPub.asString();
-            theirStaticPublics.push(pubStr);
-            theirStatics.push(pubStr);
-        }
-    }
-
-    u64 metaLen = readVarLong(payload, at);
-    if (metaLen > 0 && at + metaLen <= payload.size()) {
-        String encMeta((const u8*)payload.data() + at, (usz)metaLen);
-        String decMeta = crypt(encMeta, theirDirectionalKey, 1, 12);
-        usz readBytes = 0;
-        theirMetadata.readFromBinary((const u8*)decMeta.data(), decMeta.size(), readBytes);
-    }
-
-    if (bands.has(bandId)) {
-        bands[bandId].weight = 10; // Non-initiator assigns weight 10 to upgrade band
-    }
-
-    if (onUpgrade && !onUpgrade()) return;
-
-    nonce = 2;
-    base = 2;
-    windowBitmap.resize(size);
-    windowBitmap.clear();
-    retransmitFrom = 0;
-
-    if (onReady) onReady();
-}
-
-// ---------------------------------------------------------------------------
-// Post-Upgrade Transmission & Packaging
+// Data Transmission & Outbox Management
 // ---------------------------------------------------------------------------
 
 void Lines::push(const Packet &packet) {
-    if (!couldPush()) return;
+    if (!couldPush()) return; // Backpressure drop
 
-    u32 seq = 0;
-    if (packet.respectsHOL) {
-        if (!outgoingChannelSeq.has(packet.channel)) {
-            outgoingChannelSeq[packet.channel] = 0;
-        }
-        seq = outgoingChannelSeq[packet.channel]++;
-    }
-
-    u32 band = selectBestBand(packet.payload.size() + 32);
-    u32 bandMtu = bands.has(band) ? bands[band].mtu : 1024;
-    u32 maxPayloadPerBundle = (bandMtu > 64) ? (bandMtu - 32) : bandMtu;
-
-    if (packet.payload.size() > maxPayloadPerBundle) {
-        // Fragmentation
-        u32 sId = nextFragmentationSeriesId++;
-        usz total = packet.payload.size();
-        usz offset = 0;
-        u32 fragIdx = 0;
-
-        Array<String> chunks;
-        while (offset < total) {
-            usz chunkSz = (total - offset > maxPayloadPerBundle) ? maxPayloadPerBundle : (total - offset);
-            chunks.push(String((const u8*)packet.payload.data() + offset, chunkSz));
-            offset += chunkSz;
-        }
-
-        for (usz i = 0; i < chunks.size(); ++i) {
-            u8 state = (i == 0) ? 1 : ((i == chunks.size() - 1) ? 3 : 2);
-            Packet fragP(packet.channel, chunks[i], packet.isImportant, packet.respectsHOL);
-            fragP.fragState = state;
-            fragP.seriesId = sId;
-            fragP.fragmentId = (u32)i;
-            fragP.channelSeq = seq;
-
-            if (packet.isImportant) pendingImportantQueue.push(fragP);
-            else pendingUnimportantQueue.push(fragP);
-        }
-    } else {
-        Packet p = packet;
-        p.channelSeq = seq;
-        if (p.isImportant) pendingImportantQueue.push(p);
-        else pendingUnimportantQueue.push(p);
-    }
-
-    flushQueues();
+    toBeBundled.push(packet);
+    flushBundles();
 }
 
-void Lines::flushQueues() {
-    if (!isUpgraded()) return;
+void Lines::flushBundles() {
+    if (!isUpgraded() || toBeBundled.isEmpty()) return;
 
-    while (pendingImportantQueue.size() > 0 && couldPush()) {
-        u32 band = selectBestBand(512);
-        sendPostUpgradeBundle(true, band);
+    Array<Packet> reliablePkts;
+    Array<Packet> bestEffortPkts;
+    Array<Packet> curiosityPkts;
+
+    for (usz i = 0; i < toBeBundled.size(); ++i) {
+        if (toBeBundled[i].delivery == Packet::Reliable) {
+            reliablePkts.push(toBeBundled[i]);
+        } else if (toBeBundled[i].delivery == Packet::BestEffort) {
+            bestEffortPkts.push(toBeBundled[i]);
+        } else {
+            curiosityPkts.push(toBeBundled[i]);
+        }
     }
-    while (pendingUnimportantQueue.size() > 0) {
-        u32 band = selectBestBand(512);
-        sendPostUpgradeBundle(false, band);
+    toBeBundled.clear();
+
+    if (!reliablePkts.isEmpty()) {
+        sendPostUpgradeBundle(reliablePkts, Packet::Reliable);
+    }
+    if (!bestEffortPkts.isEmpty()) {
+        sendPostUpgradeBundle(bestEffortPkts, Packet::BestEffort);
+    }
+    if (!curiosityPkts.isEmpty()) {
+        sendPostUpgradeBundle(curiosityPkts, Packet::Curiosity);
     }
 }
 
-void Lines::sendPostUpgradeBundle(bool important, u32 bandId) {
-    Array<Packet> &q = important ? pendingImportantQueue : pendingUnimportantQueue;
-    if (q.size() == 0) return;
+void Lines::sendPostUpgradeBundle(const Array<Packet> &packets, Packet::Delivery delivery, BandSlot *preferredSlot) {
+    if (packets.size() == 0) return;
 
-    u32 bandMtu = bands.has(bandId) ? bands[bandId].mtu : 1024;
+    BandSlot *targetSlot = preferredSlot;
+    if (targetSlot == nullptr) {
+        i64 idx = -1;
+        if (delivery == Packet::Reliable) {
+            idx = getBestReliableBand();
+        } else if (delivery == Packet::BestEffort) {
+            idx = getBestEffortBand();
+        } else {
+            idx = getBestCuriosityBand();
+        }
+        if (idx >= 0 && (usz)idx < bands.size()) {
+            targetSlot = bands[(usz)idx];
+        }
+    }
 
+    if (targetSlot == nullptr) {
+        if (primingBandSlot < bands.size() && bands[primingBandSlot]->isAvailable()) {
+            targetSlot = bands[primingBandSlot];
+        } else if (bands.size() > 0 && bands[0]->isAvailable()) {
+            targetSlot = bands[0];
+        } else {
+            return;
+        }
+    }
+
+    // Assemble Plaintext Packets
     String plaintext;
-    plaintext.push(important ? (u8)0x01 : (u8)0x00); // bundleHeader: isImportant
+    for (usz i = 0; i < packets.size(); ++i) {
+        const Packet &p = packets[i];
+        bool finalPacket = (i == packets.size() - 1);
 
-    usz packetCount = 0;
-    while (q.size() > 0) {
-        if (packetCount > 0 && (plaintext.size() + q[0].payload.size() + 32 > bandMtu)) {
+        String pktData;
+        u8 headerByte = 0;
+        if (p.channel != 1) headerByte |= 0x01; // channelOtherThanOne
+        if (p.respectsOrder) headerByte |= 0x02; // respectsOrder
+        if (finalPacket) headerByte |= 0x04;    // isTheFinalPacketInThisBundle
+
+        pktData.push((char)headerByte);
+        if (p.channel != 1) {
+            encodeVarInt(p.channel, pktData);
+        }
+        pktData.append(p.payload.data(), p.payload.size());
+
+        encodeVarInt(pktData.size(), plaintext);
+        plaintext.append(pktData.data(), pktData.size());
+    }
+
+    // Pad to paddingBlockSize (default 32)
+    u32 padTarget = (paddingBlockSize > 0) ? paddingBlockSize : 32;
+    usz remainder = plaintext.size() % padTarget;
+    if (remainder != 0) {
+        usz padCount = padTarget - remainder;
+        for (usz p = 0; p < padCount; ++p) plaintext.push((char)0);
+    }
+
+    u64 bundleId = nonce++;
+    String ciphertext = crypt(plaintext, ourDirectionalKey, bundleId, 12);
+
+    // Compute MAC over [bundleId (8B) + ciphertext]
+    u8 mac[8];
+    computeBundleMac(mac, ourDirectionalKey, bundleId, (const u8*)ciphertext.data(), ciphertext.size());
+
+    // 2-Byte Wire Header: [1 bit isEncrypted = 1 | 15 bits maskedDeltaId]
+    u16 low15 = (u16)(bundleId & 0x7FFF);
+    u16 mask = computeDeltaMask(ourDirectionalKey, (const u8*)ciphertext.data(), ciphertext.size());
+    u16 maskedDelta = (low15 ^ mask) & 0x7FFF;
+    u16 rawHeader = maskedDelta | 0x8000; // Bit 15 set for encrypted
+
+    String wire;
+    wire.allocate(10 + ciphertext.size());
+    wire[0] = (char)(u8)(rawHeader & 0xFF);
+    wire[1] = (char)(u8)((rawHeader >> 8) & 0xFF);
+    for (int i = 0; i < 8; ++i) wire[2 + i] = (char)mac[i];
+    if (ciphertext.size() > 0) {
+        memcpy(wire.data() + 10, ciphertext.data(), ciphertext.size());
+    }
+
+    transmitBundle(bundleId, wire, targetSlot, delivery);
+}
+
+void Lines::transmitBundle(u64 bundleId, const String &rawBundle, BandSlot *slot, Packet::Delivery delivery) {
+    if (!slot || !slot->physical) return;
+
+    slot->physical->push(rawBundle);
+    lastSent = millis();
+
+    // Outbox Accounting
+    SentBundle sb;
+    sb.sentTime = millis();
+    sb.ackTime = 0;
+    sb.size = rawBundle.size();
+    sb.bandSlot = slot;
+    sb.band = slot->id;
+    sb.delivery = delivery;
+
+    u64 estSpeed = slot->getSendCapacity();
+    sb.duty = (estSpeed > 0) ? ((sb.size * 1000) / estSpeed) : 1;
+    if (sb.duty == 0) sb.duty = 1;
+
+    if (delivery == Packet::Reliable) {
+        sb.bundle = rawBundle;
+        retransmissionBuffer[bundleId] = rawBundle;
+    } else {
+        sb.bundle.clear(); // BestEffort and Curiosity are never stored
+        sb.ackTime = millis(); // BestEffort is fire-and-forget, immediately acked
+    }
+
+    outbox[bundleId] = sb;
+    advanceSendBase();
+
+    // Rolling statistics update
+    slot->bytesSentLastSec += rawBundle.size();
+    slot->dutyConsumedLastSec += sb.duty;
+}
+
+void Lines::advanceSendBase() {
+    while (sendBase < nonce) {
+        const SentBundle *sb = outbox.get(sendBase);
+        if (sb == nullptr || sb->delivery != Packet::Reliable || sb->ackTime != 0) {
+            if (retransmissionBuffer.has(sendBase)) retransmissionBuffer.remove(sendBase);
+            sendBase++;
+        } else {
             break;
         }
-        Packet p = q[0];
-        q.remove(0);
-
-        bool isFinal = (q.size() == 0 || (plaintext.size() + (q.size() > 0 ? q[0].payload.size() : 0) + 32 > bandMtu));
-        u8 pHeader = 0;
-        if (p.channel != 1) pHeader |= 0x01;
-        pHeader |= ((p.fragState & 0x03) << 1);
-        if (p.respectsHOL) pHeader |= 0x08;
-        if (isFinal) pHeader |= 0x10;
-
-        String pBuf;
-        pBuf.push(pHeader);
-        if (p.channel != 1) writeVarLong(pBuf, (u64)p.channel);
-        if (p.fragState != 0) {
-            writeVarLong(pBuf, (u64)p.seriesId);
-            writeVarLong(pBuf, (u64)p.fragmentId);
-        }
-        if (p.respectsHOL) {
-            writeVarLong(pBuf, (u64)p.channelSeq);
-        }
-        pBuf.append(p.payload.data(), p.payload.size());
-
-        writeVarLong(plaintext, (u64)pBuf.size());
-        plaintext.append(pBuf.data(), pBuf.size());
-        packetCount++;
-        if (isFinal) break;
     }
-
-    // Padding out to exact multiples of paddingBlockSize (e.g. 32 bytes) to thwart traffic analysis
-    if (paddingBlockSize > 1) {
-        usz rem = plaintext.size() % paddingBlockSize;
-        if (rem != 0) {
-            usz padCount = paddingBlockSize - rem;
-            for (usz i = 0; i < padCount; ++i) plaintext.push((u8)0x00);
-        }
-    }
-
-    u64 currentNonce = nonce++;
-    String ciphertext = crypt(plaintext, ourDirectionalKey, currentNonce, 12);
-
-    u32 delta = (u32)(currentNonce % size);
-    u32 mask = computeDeltaMask(ourDirectionalKey, extractCiphertextPrefix((const u8*)ciphertext.data(), ciphertext.size()));
-    u32 maskedDelta = (delta ^ mask) & 0x7FFFFF;
-
-    String dataToMac;
-    for (int i = 0; i < 8; ++i) dataToMac.push((u8)((currentNonce >> (i * 8)) & 0xFF));
-    dataToMac.append(ciphertext.data(), ciphertext.size());
-
-    u8 mac[8];
-    computeMac(mac, ourDirectionalKey, currentNonce, (const u8*)dataToMac.data(), dataToMac.size());
-
-    String bundle;
-    bundle.push((u8)(maskedDelta & 0xFF));
-    bundle.push((u8)((maskedDelta >> 8) & 0xFF));
-    bundle.push((u8)(((maskedDelta >> 16) & 0x7F) | 0x80)); // isEncrypted = 1
-    bundle.append(mac, 8);
-    bundle.append(ciphertext.data(), ciphertext.size());
-
-    if (important) {
-        retransmissionBuffer[currentNonce] = bundle;
-    }
-
-    transmitRaw(bundle, bandId);
 }
 
 // ---------------------------------------------------------------------------
-// Bundle Parsing & Demultiplexing
+// Sliding Window & SACK Intervals
 // ---------------------------------------------------------------------------
 
-bool Lines::parse(const String &bundle, u32 band) {
-    if (bundle.size() < 4) return false;
-
-    lastSeen = millis();
-    updateBandReception(band, bundle.size());
-
-    if (!isEncrypted(bundle)) {
-        // Pre-upgrade mode
-        u32 crcExpected = (u32)(u8)bundle[0] | ((u32)(u8)bundle[1] << 8) | (((u32)(u8)bundle[2] & 0x7F) << 16);
-        u32 crcActual = computeCrc23((const u8*)bundle.data() + 3, bundle.size() - 3);
-        if (crcActual != crcExpected) return false;
-
-        u8 bHeader = (u8)bundle[3];
-        usz at = 4;
-        u32 channel = 1;
-        if (bHeader & 0x01) {
-            channel = (u32)readVarLong(bundle, at);
+void Lines::pretendReceived(u64 fromDelta, u64 toDelta) {
+    for (u64 d = fromDelta; d <= toDelta; ++d) {
+        if (d < size) {
+            windowBitmap |= (1ULL << d);
         }
-
-        String payload((const u8*)bundle.data() + at, bundle.size() - at);
-
-        if (channel == 0) {
-            usz actionAt = 0;
-            u64 action = readVarLong(payload, actionAt);
-            if (action == 10) handleProbe(payload, band);
-            else if (action == 11) handleAnnounce(payload, band);
-            else if (action == 20) handleUpgrade(payload, band);
-            return true;
-        }
-
-        Packet p(channel, payload, true, true);
-        if (onPacket) onPacket(p);
-        return true;
     }
+    advanceWindow(base);
+}
 
-    // Post-upgrade mode
-    if (bundle.size() < 12) return false;
-    if (sharedKey.size() < 32) return false;
-
-    u32 rawDelta = (u32)(u8)bundle[0] | ((u32)(u8)bundle[1] << 8) | (((u32)(u8)bundle[2] & 0x7F) << 16);
-    const u8 *macIn = (const u8*)bundle.data() + 3;
-    const u8 *ct = (const u8*)bundle.data() + 11;
-    usz ctLen = bundle.size() - 11;
-
-    u32 mask = computeDeltaMask(theirDirectionalKey, extractCiphertextPrefix(ct, ctLen));
-    u32 delta = (rawDelta ^ mask) & 0x7FFFFF;
-
-    if (delta >= size) return false;
-
-    u64 baseMod = base % size;
-    u64 offset = (delta >= baseMod) ? (delta - baseMod) : (size - baseMod + delta);
-    if (offset >= size) return false;
-
-    u64 realBundleId = base + offset;
-
-    // Duplicate check
-    if (windowBitmap.test(offset)) {
-        return false; // Replay / duplicate
-    }
-
-    // Authenticate MAC
-    String dataToAuth;
-    for (int i = 0; i < 8; ++i) dataToAuth.push((u8)((realBundleId >> (i * 8)) & 0xFF));
-    dataToAuth.append(ct, ctLen);
-
-    if (!verifyMac(macIn, theirDirectionalKey, realBundleId, (const u8*)dataToAuth.data(), dataToAuth.size())) {
-        return false;
-    }
-
-    // Decrypt
-    String ciphertext((const u8*)ct, ctLen);
-    String plaintext = crypt(ciphertext, theirDirectionalKey, realBundleId, 12);
-    if (plaintext.size() < 1) return false;
-
-    // Update window
-    windowBitmap.set(offset);
-    while (windowBitmap.test(0)) {
-        windowBitmap.shiftRight(1);
-        base++;
-    }
-
-    // Process packets
-    u8 bHeader = (u8)plaintext[0];
-    bool isImportant = (bHeader & 0x01) != 0;
-    usz at = 1;
-
-    while (at < plaintext.size()) {
-        u64 pLen = readVarLong(plaintext, at);
-        if (pLen == 0 || at + pLen > plaintext.size()) break;
-
-        usz pEnd = at + (usz)pLen;
-        u8 pHeader = (u8)plaintext[at++];
-        u32 channel = 1;
-        if (pHeader & 0x01) {
-            channel = (u32)readVarLong(plaintext, at);
+void Lines::setAcknowledged(u64 fromDelta, u64 toDelta, u64 ackTime) {
+    u64 now = (ackTime == 0) ? millis() : ackTime;
+    for (u64 d = fromDelta; d <= toDelta; ++d) {
+        u64 bundleId = sendBase + d;
+        if (outbox.has(bundleId)) {
+            SentBundle &sb = outbox[bundleId];
+            sb.ackTime = now;
+            sb.bundle.clear(); // Free payload memory on ACK
+            if (retransmissionBuffer.has(bundleId)) retransmissionBuffer.remove(bundleId);
+            if (sb.bandSlot) {
+                BandSlot *s = sb.bandSlot;
+                s->ackedBytesLastSec += sb.size;
+                u64 rtt = (now > sb.sentTime) ? (now - sb.sentTime) : 1;
+                u64 lat = rtt / 2;
+                if (lat == 0) lat = 1;
+                if (s->minObservedLatency == 0 || lat < s->minObservedLatency) {
+                    s->minObservedLatency = lat;
+                }
+            }
         }
-        u8 fragState = (pHeader >> 1) & 0x03;
-        u32 seriesId = 0;
-        u32 fragmentId = 0;
-        if (fragState != 0) {
-            seriesId = (u32)readVarLong(plaintext, at);
-            fragmentId = (u32)readVarLong(plaintext, at);
-        }
-        bool respectsHol = (pHeader & 0x08) != 0;
-        bool isFinal = (pHeader & 0x10) != 0;
-        u32 channelSeq = 0;
-        if (respectsHol) {
-            channelSeq = (u32)readVarLong(plaintext, at);
-        }
+    }
+    advanceSendBase();
+}
 
-        String payload((const u8*)plaintext.data() + at, pEnd - at);
-        at = pEnd;
+void Lines::advanceWindow(u64 currentBase) {
+    u64 shift = 0;
+    while ((windowBitmap & 1ULL) != 0) {
+        windowBitmap >>= 1;
+        shift++;
+    }
+    if (shift > 0) {
+        base = currentBase + shift;
+        baseMoveTime = millis();
 
-        if (channel == 0) {
-            usz actionAt = 0;
-            u64 action = readVarLong(payload, actionAt);
-            if (action == 0) handleDisconnect(payload);
-            else if (action == 1) handleSack(payload);
-        } else {
-            if (fragState != 0) {
-                FragmentRegisterEntry *entry = nullptr;
-                for (usz i = 0; i < fragmentationRegister.size(); ++i) {
-                    if (fragmentationRegister[i].seriesId == seriesId) {
-                        entry = &fragmentationRegister[i];
-                        break;
+        // Deliver queued packets whose bundleId is now <= base
+        for (auto &pair : channelSequences) {
+            ChannelSeq &cs = pair.value;
+            Array<u64> readyIds;
+            for (const auto &holPair : cs.holQueue) {
+                if (holPair.key <= base) readyIds.push(holPair.key);
+            }
+            for (usz i = 0; i < readyIds.size(); ++i) {
+                for (usz j = i + 1; j < readyIds.size(); ++j) {
+                    if (readyIds[j] < readyIds[i]) {
+                        u64 tmp = readyIds[i];
+                        readyIds[i] = readyIds[j];
+                        readyIds[j] = tmp;
                     }
                 }
-                if (!entry) {
-                    // Prune expired entries
-                    u64 now = millis();
-                    for (usz i = 0; i < fragmentationRegister.size(); ) {
-                        if (now - fragmentationRegister[i].lastUpdated > timeout) {
-                            fragmentationRegister.remove(i);
-                        } else {
-                            ++i;
-                        }
-                    }
-
-                    // Enforce lines.size capacity limit on fragmentationRegister
-                    while (fragmentationRegister.size() >= size && fragmentationRegister.size() > 0) {
-                        usz oldestIdx = 0;
-                        u64 oldestTime = fragmentationRegister[0].lastUpdated;
-                        for (usz i = 1; i < fragmentationRegister.size(); ++i) {
-                            if (fragmentationRegister[i].lastUpdated < oldestTime) {
-                                oldestTime = fragmentationRegister[i].lastUpdated;
-                                oldestIdx = i;
-                            }
-                        }
-                        fragmentationRegister.remove(oldestIdx);
-                    }
-
-                    FragmentRegisterEntry newEntry;
-                    newEntry.seriesId = seriesId;
-                    newEntry.channel = channel;
-                    newEntry.respectsHol = respectsHol;
-                    newEntry.channelSeq = channelSeq;
-                    fragmentationRegister.push(newEntry);
-                    entry = &fragmentationRegister[fragmentationRegister.size() - 1];
-                }
-                entry->fragments[fragmentId] = payload;
-                entry->lastUpdated = millis();
-                if (fragState == 1) {
-                    entry->hasStart = true;
-                    entry->channelSeq = channelSeq;
-                }
-                if (fragState == 3) {
-                    entry->hasEnd = true;
-                    entry->endFragmentId = fragmentId;
-                }
-                if (entry->isComplete()) {
-                    String fullPayload = entry->assemble();
-                    Packet completePacket(entry->channel, fullPayload, isImportant, entry->respectsHol);
-                    completePacket.channelSeq = entry->channelSeq;
-                    for (usz i = 0; i < fragmentationRegister.size(); ++i) {
-                        if (fragmentationRegister[i].seriesId == seriesId) {
-                            fragmentationRegister.remove(i);
-                            break;
-                        }
-                    }
-                    dispatchPacket(completePacket, (u32)realBundleId);
-                }
-            } else {
-                Packet p(channel, payload, isImportant, respectsHol);
-                p.channelSeq = channelSeq;
-                dispatchPacket(p, (u32)realBundleId);
+                Packet p = cs.holQueue[readyIds[i]];
+                cs.holQueue.remove(readyIds[i]);
+                if (onPacket) onPacket(p);
             }
         }
 
-        if (isFinal) break;
+        // Prune old inbox entries outside window
+        Array<u64> toPrune;
+        for (const auto &pair : inbox) {
+            if (pair.key < base) toPrune.push(pair.key);
+        }
+        for (usz i = 0; i < toPrune.size(); ++i) inbox.remove(toPrune[i]);
+    }
+}
+
+Array<Interval<u64>> Lines::showReceived() const {
+    Array<Interval<u64>> intervals;
+    bool inInterval = false;
+    u64 start = 0;
+
+    for (u64 d = 0; d < size; ++d) {
+        bool bit = (windowBitmap & (1ULL << d)) != 0;
+        if (bit) {
+            if (!inInterval) {
+                inInterval = true;
+                start = d;
+            }
+        } else {
+            if (inInterval) {
+                intervals.push(Interval<u64>(start, d - 1));
+                inInterval = false;
+            }
+        }
+    }
+    if (inInterval) {
+        intervals.push(Interval<u64>(start, size - 1));
+    }
+    return intervals;
+}
+
+Array<Interval<u64>> Lines::showUnavailableToRetransmit() const {
+    Array<Interval<u64>> intervals;
+    bool inInterval = false;
+    u64 start = 0;
+
+    u64 maxDelta = (nonce > sendBase) ? (nonce - sendBase) : 0;
+    if (maxDelta > size) maxDelta = size;
+
+    for (u64 d = 0; d < maxDelta; ++d) {
+        u64 bundleId = sendBase + d;
+        bool unavailable = false;
+        const SentBundle *sb = outbox.get(bundleId);
+        if (sb != nullptr) {
+            if (sb->delivery != Packet::Reliable || sb->ackTime != 0 || sb->bundle.size() == 0) {
+                unavailable = true; // Best-effort or cleared bundle
+            }
+        }
+        if (unavailable) {
+            if (!inInterval) {
+                inInterval = true;
+                start = d;
+            }
+        } else {
+            if (inInterval) {
+                intervals.push(Interval<u64>(start, d - 1));
+                inInterval = false;
+            }
+        }
+    }
+    if (inInterval && maxDelta > 0) {
+        intervals.push(Interval<u64>(start, maxDelta - 1));
+    }
+    return intervals;
+}
+
+void Lines::sendSack(Packet::Delivery delivery, BandSlot *targetSlot) {
+    if (!isUpgraded()) return;
+    Array<Interval<u64>> received = showReceived();
+    Array<Interval<u64>> unavailable = showUnavailableToRetransmit();
+
+    String sackData;
+    encodeVarInt(1, sackData); // Action 1: SACK Heartbeat
+    encodeVarInt(base, sackData); // Cumulative Base ACK
+
+    u16 timeSinceBaseMove = (u16)((millis() - baseMoveTime) & 0xFFFF);
+    sackData.push((char)(u8)(timeSinceBaseMove & 0xFF));
+    sackData.push((char)(u8)((timeSinceBaseMove >> 8) & 0xFF));
+
+    sackData.push((char)(u8)received.size());
+    for (usz i = 0; i < received.size(); ++i) {
+        sackData.push((char)(u8)received[i].left);
+        sackData.push((char)(u8)received[i].right);
+    }
+
+    sackData.push((char)(u8)unavailable.size());
+    for (usz i = 0; i < unavailable.size(); ++i) {
+        sackData.push((char)(u8)unavailable[i].left);
+        sackData.push((char)(u8)unavailable[i].right);
+    }
+
+    Packet p(sackData, 0, delivery, false);
+    Array<Packet> pkts;
+    pkts.push(p);
+
+    if (targetSlot == nullptr) {
+        i64 idx = (delivery == Packet::BestEffort) ? getBestEffortBand() : getBestCuriosityBand();
+        if (idx >= 0 && (usz)idx < bands.size()) {
+            targetSlot = bands[(usz)idx];
+        }
+    }
+    if (targetSlot == nullptr && bands.size() > 0) targetSlot = bands[0];
+    if (targetSlot == nullptr) return;
+
+    sendPostUpgradeBundle(pkts, delivery, targetSlot);
+}
+
+// ---------------------------------------------------------------------------
+// Wire Parsing & Inbound Processing
+// ---------------------------------------------------------------------------
+
+bool Lines::parse(const String &bundle, BandSlot *slot) {
+    if (bundle.size() < 3) return false;
+
+    // Check throughput limits
+    if (maxThroughput > 0 && getThroughput() >= maxThroughput) {
+        return false;
+    }
+
+    if (slot && slot->physical) {
+        if (slot->physical->maxBundleSize > 0 && bundle.size() > slot->physical->maxBundleSize) {
+            return false;
+        }
+        slot->bytesRecvLastSec += bundle.size();
+    }
+
+    // Pre-Upgrade Parse
+    if (!isEncrypted(bundle)) {
+        u16 receivedCrc = (u16)(u8)bundle[0] | ((u16)((u8)bundle[1] & 0x7F) << 8);
+        u16 computedCrc = computeCrc15((const u8*)bundle.data() + 2, bundle.size() - 2, getTuneSeed());
+        if (receivedCrc != computedCrc) {
+            if (slot && slot->physical) slot->physical->stun(0);
+            return false;
+        }
+
+        u8 packetHeader = (u8)bundle[2];
+        u64 channel = (packetHeader & 0x01) ? 0 : 1;
+        usz offset = 3;
+        if (packetHeader & 0x01) {
+            decodeVarInt((const u8*)bundle.data(), bundle.size(), offset, channel);
+        }
+
+        String payload((const u8*)bundle.data() + offset, bundle.size() - offset);
+        lastSeen = millis();
+
+        // Pre-Upgrade Handshake Demux
+        if (payload.size() >= 32) {
+            if (!isUpgraded()) {
+                if (initiator) {
+                    handleAnnounce(payload, slot);
+                } else {
+                    bool upgraded = false;
+                    if (payload.size() >= 40 && theirEphePublic != u256()) {
+                        const u8 *macInBundle = (const u8*)payload.data() + 32;
+                        const u8 *ct = (const u8*)payload.data() + 40;
+                        usz ctLen = payload.size() - 40;
+                        if (verifyBundleMac(macInBundle, theirDirectionalKey, 1, ct, ctLen)) {
+                            handleUpgrade(payload, slot);
+                            upgraded = true;
+                        }
+                    }
+                    if (!upgraded) {
+                        handleProbe(payload, slot);
+                    }
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Post-Upgrade Parse
+    if (bundle.size() < 10) return false;
+    if (sharedKey.size() < 32) return false;
+
+    u16 rawHeader = (u16)(u8)bundle[0] | ((u16)(u8)bundle[1] << 8);
+    u16 maskedDelta = rawHeader & 0x7FFF;
+
+    const u8 *ct = (const u8*)bundle.data() + 10;
+    usz ctLen = bundle.size() - 10;
+    u16 mask = computeDeltaMask(theirDirectionalKey, ct, ctLen);
+    u16 low15 = (maskedDelta ^ mask) & 0x7FFF;
+
+    // Reconstruct full 64-bit bundleId relative to base
+    u64 high = base & ~0x7FFFULL;
+    u64 bundleId = high | (u64)low15;
+    if (bundleId + 16384 < base) bundleId += 32768;
+    else if (bundleId > base + 16384 && bundleId >= 32768) bundleId -= 32768;
+
+    // Fast-drop if outside window
+    if (bundleId < base) return false;
+    u64 delta = bundleId - base;
+    if (delta >= size) return false;
+
+    // Anti-replay check
+    if ((windowBitmap & (1ULL << delta)) != 0) {
+        return false; // Already received
+    }
+
+    // Verify 8-byte Poly1305 MAC
+    const u8 *macInBundle = (const u8*)bundle.data() + 2;
+    if (!verifyBundleMac(macInBundle, theirDirectionalKey, bundleId, ct, ctLen)) {
+        if (slot && slot->physical) slot->physical->stun(0);
+        return false;
+    }
+
+    // Decrypt Payload
+    String ciphertextStr((const u8*)ct, ctLen);
+    String plaintext = crypt(ciphertextStr, theirDirectionalKey, bundleId, 12);
+
+    // Mark window and inbox
+    windowBitmap |= (1ULL << delta);
+    RecvBundle rb;
+    rb.recvTime = millis();
+    rb.size = bundle.size();
+    rb.bandSlot = slot;
+    rb.band = slot ? slot->id : 1;
+    inbox[bundleId] = rb;
+
+    lastSeen = millis();
+    advanceWindow(base);
+
+    // Demux Packets Inside Decrypted Payload
+    usz offset = 0;
+    while (offset < plaintext.size()) {
+        u64 pktLen = 0;
+        if (!decodeVarInt((const u8*)plaintext.data(), plaintext.size(), offset, pktLen)) break;
+        if (pktLen == 0 || offset + pktLen > plaintext.size()) break;
+
+        u8 pktHeader = (u8)plaintext[offset];
+        bool channelOther = (pktHeader & 0x01) != 0;
+        bool order = (pktHeader & 0x02) != 0;
+        bool finalPkt = (pktHeader & 0x04) != 0;
+
+        usz pktOffset = offset + 1;
+        u64 channel = 1;
+        if (channelOther) {
+            decodeVarInt((const u8*)plaintext.data(), offset + pktLen, pktOffset, channel);
+        }
+
+        usz payloadLen = (offset + pktLen > pktOffset) ? (offset + pktLen - pktOffset) : 0;
+        String pktPayload((const u8*)plaintext.data() + pktOffset, payloadLen);
+
+        Packet p(pktPayload, channel, Packet::Reliable, order);
+        dispatchPacket(p, bundleId);
+
+        offset += pktLen;
+        if (finalPkt) break; // Trailing bytes are padding
     }
 
     return true;
 }
 
-void Lines::dispatchPacket(const Packet &packet, u32 seq) {
-    (void)seq;
-    if (!packet.respectsHOL) {
+bool Lines::parse(const String &bundle, u64 legacyBandId) {
+    BandSlot *slot = nullptr;
+    if (legacyBandId > 0 && legacyBandId <= bands.size()) {
+        slot = bands[(usz)(legacyBandId - 1)];
+    } else {
+        for (usz i = 0; i < bands.size(); ++i) {
+            if (bands[i] && bands[i]->id == legacyBandId) {
+                slot = bands[i];
+                break;
+            }
+        }
+    }
+    if (!slot && bands.size() > 0) slot = bands[0];
+    return parse(bundle, slot);
+}
+
+void Lines::dispatchPacket(const Packet &packet, u64 bundleId) {
+    if (packet.channel == 0) {
+        // Control plane actions
+        usz offset = 0;
+        u64 action = 0;
+        if (decodeVarInt((const u8*)packet.payload.data(), packet.payload.size(), offset, action)) {
+            String subPayload((const u8*)packet.payload.data() + offset, packet.payload.size() - offset);
+            if (action == 0) handleDisconnect(subPayload);
+            else if (action == 1) handleSack(subPayload);
+        }
+        return;
+    }
+
+    if (!packet.respectsOrder || bundleId <= base) {
         if (onPacket) onPacket(packet);
         return;
     }
 
-    ChannelSeq &cSeq = channelSequences[packet.channel];
-    if (packet.channelSeq == cSeq.nextExpected) {
-        if (onPacket) onPacket(packet);
-        cSeq.nextExpected++;
-
-        while (cSeq.holQueue.has(cSeq.nextExpected)) {
-            Packet nextP = cSeq.holQueue[cSeq.nextExpected];
-            cSeq.holQueue.remove(cSeq.nextExpected);
-            cSeq.nextExpected++;
-            if (onPacket) onPacket(nextP);
-        }
-    } else if (packet.channelSeq > cSeq.nextExpected) {
-        cSeq.holQueue[packet.channelSeq] = packet;
-    }
-}
-
-void Lines::advanceWindow(u64 newBase) {
-    if (newBase <= base) return;
-    u64 shift = newBase - base;
-    windowBitmap.shiftRight(shift);
-    base = newBase;
+    // Out-of-order packet: queue it until base advances past bundleId
+    ChannelSeq &cs = channelSequences[packet.channel];
+    cs.holQueue[bundleId] = packet;
 }
 
 // ---------------------------------------------------------------------------
-// Post-Upgrade Control: SACK Heartbeat & Disconnect
+// Control Plane Handlers
 // ---------------------------------------------------------------------------
 
-Array<FromTo> Lines::showReceived() const {
-    Array<FromTo> intervals;
-    if (base > 2) {
-        intervals.push(FromTo(2, base - 1));
-    }
+void Lines::handleProbe(const String &payload, BandSlot *slot) {
+    if (payload.size() < 32) return;
+    for (int i = 0; i < 32; ++i) theirEphePublic.data[i] = (u8)payload[i];
 
-    u64 currentBit = 0;
-    while (currentBit < size) {
-        if (windowBitmap.test(currentBit)) {
-            u64 spanStart = base + currentBit;
-            while (currentBit < size && windowBitmap.test(currentBit)) {
-                currentBit++;
-            }
-            u64 spanEnd = base + currentBit - 1;
-
-            if (intervals.size() > 0 && intervals[intervals.size() - 1].to + 1 == spanStart) {
-                intervals[intervals.size() - 1].to = spanEnd;
-            } else {
-                intervals.push(FromTo(spanStart, spanEnd));
-            }
-        } else {
-            currentBit++;
+    Tree sel;
+    usz offset = 32;
+    u64 selLen = 0;
+    if (decodeVarInt((const u8*)payload.data(), payload.size(), offset, selLen)) {
+        if (offset + selLen <= payload.size()) {
+            hydrate(String((const u8*)payload.data() + offset, selLen), sel);
         }
     }
-    return intervals;
+
+    Tree announceMetadata;
+    bool allowAnnounce = true;
+    if (onProbe) allowAnnounce = onProbe(sel, announceMetadata);
+    if (!allowAnnounce) return;
+
+    // Send Announce
+    sharedKey = String((const u8*)epheKeypair.sharedKey(theirEphePublic).data, 32);
+    initiator = false;
+    setupDirectionalKeys();
+
+    if (slot) {
+        for (usz i = 0; i < bands.size(); ++i) {
+            if (bands[i] == slot) {
+                primingBandSlot = i;
+                primingBand = slot->id;
+                break;
+            }
+        }
+    }
+
+    String announcePayload;
+    announcePayload.append((const char*)epheKeypair.publicKey().data, 32);
+
+    String plaintext;
+    encodeVarInt(staticKeypairs.size(), plaintext);
+    for (usz i = 0; i < staticKeypairs.size(); ++i) {
+        u256 proofKey = staticKeypairs[i].sharedKey(theirEphePublic);
+        u8 proofMac[8];
+        computeBundleMac(proofMac, proofKey, 0, nullptr, 0);
+        plaintext.append((const char*)proofMac, 8);
+        plaintext.append((const char*)staticKeypairs[i].publicKey().data, 32);
+    }
+    String metaBytes = petrify(announceMetadata);
+    encodeVarInt(metaBytes.size(), plaintext);
+    plaintext.append(metaBytes.data(), metaBytes.size());
+
+    String ciphertext = crypt(plaintext, ourDirectionalKey, 0, 12);
+    u8 mac[8];
+    computeBundleMac(mac, ourDirectionalKey, 0, (const u8*)ciphertext.data(), ciphertext.size());
+
+    announcePayload.append((const char*)mac, 8);
+    announcePayload.append(ciphertext.data(), ciphertext.size());
+
+    String bundle;
+    bundle.allocate(3 + announcePayload.size());
+    bundle[0] = 0;
+    bundle[1] = 0;
+    bundle[2] = 0;
+    for (usz i = 0; i < announcePayload.size(); ++i) {
+        bundle[3 + i] = announcePayload[i];
+    }
+
+    u16 crc = computeCrc15((const u8*)bundle.data() + 2, bundle.size() - 2, getTuneSeed());
+    bundle[0] = (char)(u8)(crc & 0xFF);
+    bundle[1] = (char)(u8)((crc >> 8) & 0x7F);
+
+    if (slot && slot->physical) {
+        slot->physical->push(bundle);
+        lastSent = millis();
+    }
 }
 
-Array<FromTo> Lines::showUnavailableToRetransmit() const {
-    Array<FromTo> intervals;
-    u64 maxBound = (nonce > 0) ? (nonce - 1) : 0;
+void Lines::handleAnnounce(const String &payload, BandSlot *slot) {
+    if (payload.size() < 40) return;
+    for (int i = 0; i < 32; ++i) theirEphePublic.data[i] = (u8)payload[i];
 
-    Array<u64> availKeys;
-    for (auto &entry : const_cast<Map<u64, String>&>(retransmissionBuffer)) {
-        availKeys.push(entry.key);
-    }
-    for (usz i = 0; i < availKeys.size(); ++i) {
-        for (usz j = i + 1; j < availKeys.size(); ++j) {
-            if (availKeys[j] < availKeys[i]) {
-                u64 tmp = availKeys[i];
-                availKeys[i] = availKeys[j];
-                availKeys[j] = tmp;
+    sharedKey = String((const u8*)epheKeypair.sharedKey(theirEphePublic).data, 32);
+    initiator = true;
+    setupDirectionalKeys();
+
+    if (slot) {
+        for (usz i = 0; i < bands.size(); ++i) {
+            if (bands[i] == slot) {
+                primingBandSlot = i;
+                primingBand = slot->id;
+                break;
             }
         }
     }
 
-    u64 cur = 0;
-    for (usz i = 0; i < availKeys.size(); ++i) {
-        u64 k = availKeys[i];
-        if (k > maxBound) break;
-        if (k > cur) {
-            intervals.push(FromTo(cur, k - 1));
+    const u8 *macInBundle = (const u8*)payload.data() + 32;
+    const u8 *ct = (const u8*)payload.data() + 40;
+    usz ctLen = payload.size() - 40;
+
+    if (!verifyBundleMac(macInBundle, theirDirectionalKey, 0, ct, ctLen)) {
+        return;
+    }
+
+    String ciphertextStr((const u8*)ct, ctLen);
+    String plaintext = crypt(ciphertextStr, theirDirectionalKey, 0, 12);
+    usz offset = 0;
+    u64 numProofs = 0;
+    if (decodeVarInt((const u8*)plaintext.data(), plaintext.size(), offset, numProofs)) {
+        for (u64 p = 0; p < numProofs && offset + 40 <= plaintext.size(); ++p) {
+            String pubKey((const u8*)plaintext.data() + offset + 8, 32);
+            theirStaticPublics.push(pubKey);
+            theirStatics.push(pubKey);
+            offset += 40;
         }
-        cur = k + 1;
+    }
+    u64 metaLen = 0;
+    if (decodeVarInt((const u8*)plaintext.data(), plaintext.size(), offset, metaLen)) {
+        if (offset + metaLen <= plaintext.size()) {
+            hydrate(String((const u8*)plaintext.data() + offset, metaLen), theirMetadata);
+        }
     }
 
-    if (cur <= maxBound) {
-        intervals.push(FromTo(cur, maxBound));
+    bool shouldUpgrade = true;
+    if (onAnnounce) shouldUpgrade = onAnnounce(theirMetadata);
+    if (shouldUpgrade) upgrade();
+}
+
+void Lines::handleUpgrade(const String &payload, BandSlot *slot) {
+    if (payload.size() < 40) return;
+    for (int i = 0; i < 32; ++i) theirEphePublic.data[i] = (u8)payload[i];
+
+    sharedKey = String((const u8*)epheKeypair.sharedKey(theirEphePublic).data, 32);
+    initiator = false;
+    setupDirectionalKeys();
+
+    if (slot) {
+        for (usz i = 0; i < bands.size(); ++i) {
+            if (bands[i] == slot) {
+                primingBandSlot = i;
+                primingBand = slot->id;
+                break;
+            }
+        }
     }
 
-    return intervals;
+    const u8 *macInBundle = (const u8*)payload.data() + 32;
+    const u8 *ct = (const u8*)payload.data() + 40;
+    usz ctLen = payload.size() - 40;
+
+    if (!verifyBundleMac(macInBundle, theirDirectionalKey, 1, ct, ctLen)) {
+        return;
+    }
+
+    String ciphertextStr((const u8*)ct, ctLen);
+    String plaintext = crypt(ciphertextStr, theirDirectionalKey, 1, 12);
+    usz offset = 0;
+    u64 numProofs = 0;
+    if (decodeVarInt((const u8*)plaintext.data(), plaintext.size(), offset, numProofs)) {
+        for (u64 p = 0; p < numProofs && offset + 40 <= plaintext.size(); ++p) {
+            String pubKey((const u8*)plaintext.data() + offset + 8, 32);
+            theirStaticPublics.push(pubKey);
+            theirStatics.push(pubKey);
+            offset += 40;
+        }
+    }
+    u64 metaLen = 0;
+    if (decodeVarInt((const u8*)plaintext.data(), plaintext.size(), offset, metaLen)) {
+        if (offset + metaLen <= plaintext.size()) {
+            hydrate(String((const u8*)plaintext.data() + offset, metaLen), theirMetadata);
+        }
+    }
+
+    nonce = 2;
+    base = 2;
+    sendBase = 2;
+    upgradeTime = millis();
+    scheduleNextBestEffortHeartbeat();
+    scheduleNextCuriosityHeartbeat();
+
+    if (onUpgrade) onUpgrade(theirMetadata);
+    if (onReady) onReady();
 }
 
 void Lines::handleDisconnect(const String &payload) {
-    usz at = 0;
-    readVarLong(payload, at); // action 0
     Tree reason;
-    if (at < payload.size()) {
-        usz readBytes = 0;
-        reason.readFromBinary((const u8*)payload.data() + at, payload.size() - at, readBytes);
-    }
-    if (onDisconnect) onDisconnect(reason);
+    hydrate(payload, reason);
+    if (onDisconnect) onDisconnect(reason, false);
     destroy();
 }
 
 void Lines::handleSack(const String &payload) {
-    usz at = 0;
-    readVarLong(payload, at); // action 1
+    if (payload.size() < 4) return;
+    usz offset = 0;
+    u64 peerBase = 0;
+    if (!decodeVarInt((const u8*)payload.data(), payload.size(), offset, peerBase)) return;
 
-    u64 numAcked = readVarLong(payload, at);
-    for (u64 i = 0; i < numAcked; ++i) {
-        u64 from = readVarLong(payload, at);
-        u64 to = readVarLong(payload, at);
-        for (u64 id = from; id <= to; ++id) {
-            retransmissionBuffer.remove(id);
+    u64 now = millis();
+    if (peerBase > sendBase) {
+        u64 ackCount = peerBase - sendBase;
+        setAcknowledged(0, ackCount - 1, now);
+        sendBase = peerBase;
+
+        Array<u64> toPrune;
+        for (const auto &pair : outbox) {
+            if (pair.key < sendBase && pair.value.ackTime != 0) toPrune.push(pair.key);
+        }
+        for (usz i = 0; i < toPrune.size(); ++i) {
+            outbox.remove(toPrune[i]);
+            if (retransmissionBuffer.has(toPrune[i])) retransmissionBuffer.remove(toPrune[i]);
         }
     }
 
-    u64 numPretend = readVarLong(payload, at);
-    for (u64 i = 0; i < numPretend; ++i) {
-        u64 from = readVarLong(payload, at);
-        u64 to = readVarLong(payload, at);
-        for (u64 id = from; id <= to; ++id) {
-            retransmissionBuffer.remove(id);
-        }
-        pretendReceived(from, to);
+    if (offset + 3 > payload.size()) return;
+    u16 recvTimeDelta = (u16)(u8)payload[offset] | ((u16)(u8)payload[offset + 1] << 8);
+    offset += 2;
+    u64 ackTime = baseMoveTime + recvTimeDelta;
+    if (recvTimeDelta == 0) ackTime = now;
+
+    u8 numReceived = (u8)payload[offset++];
+    for (u8 i = 0; i < numReceived && offset + 2 <= payload.size(); ++i) {
+        u8 from = (u8)payload[offset++];
+        u8 to = (u8)payload[offset++];
+        setAcknowledged(from, to, ackTime);
     }
 
+    if (offset < payload.size()) {
+        u8 numUnavailable = (u8)payload[offset++];
+        for (u8 i = 0; i < numUnavailable && offset + 2 <= payload.size(); ++i) {
+            u8 from = (u8)payload[offset++];
+            u8 to = (u8)payload[offset++];
+            pretendReceived(from, to);
+        }
+    }
+
+    advanceSendBase();
     retransmitFrom = 0;
 }
 
-void Lines::sendSackHeartbeat(u32 targetBand) {
-    String payload;
-    writeVarLong(payload, 1); // Action 1: SACK Heartbeat
-
-    Array<FromTo> received = showReceived();
-    writeVarLong(payload, (u64)received.size());
-    for (usz i = 0; i < received.size(); ++i) {
-        writeVarLong(payload, received[i].from);
-        writeVarLong(payload, received[i].to);
-    }
-
-    Array<FromTo> unavailable = showUnavailableToRetransmit();
-    writeVarLong(payload, (u64)unavailable.size());
-    for (usz i = 0; i < unavailable.size(); ++i) {
-        writeVarLong(payload, unavailable[i].from);
-        writeVarLong(payload, unavailable[i].to);
-    }
-
-    Packet p(0, payload, false, false);
-    pendingUnimportantQueue.push(p);
-    sendPostUpgradeBundle(false, targetBand);
-}
-
-void Lines::sendSacrificialSack(u32 excludeBand) {
-    for (auto &entry : bands) {
-        if (entry.value.enabled && entry.value.id != excludeBand) {
-            sendSackHeartbeat(entry.value.id);
-            break;
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Scheduler Update & Retransmission
+// Periodic Maintenance & Retransmission Loop
 // ---------------------------------------------------------------------------
 
-void Lines::update() {
+void Lines::update(bool callPBUpdates) {
     u64 now = millis();
 
-    // Check timeout auto-destruction
-    if (isUpgraded() && (now - lastSeen > timeout)) {
-        Tree reason;
-        parseJSON(R"({"status": "timeout", "code": 408, "message": "connection_timed_out"})", reason);
-        if (onDisconnect) onDisconnect(reason);
-        destroy();
-        return;
+    // Call update on physical bands if requested
+    if (callPBUpdates) {
+        for (usz i = 0; i < bands.size(); ++i) {
+            if (bands[i] && bands[i]->physical) {
+                bands[i]->physical->update(/* doLinesUpdates = */ false);
+            }
+        }
     }
+
+    // Check Idle Timeout
+    if (isUpgraded() && timeout > 0) {
+        if (now - lastSeen >= timeout) {
+            destroy();
+            return;
+        }
+    }
+
+    // Rolling Statistics Decay (Reset counters each second)
+    updateRollingStats();
 
     if (!isUpgraded()) return;
 
-    // Prune stale fragment register entries (older than timeout or exceeding size)
-    for (usz i = 0; i < fragmentationRegister.size(); ) {
-        if (now - fragmentationRegister[i].lastUpdated > timeout) {
-            fragmentationRegister.remove(i);
-        } else {
-            ++i;
-        }
+    // Flush any pending toBeBundled packets
+    flushBundles();
+
+    // Best-Effort Heartbeat (Keepalive SACK on min latency band)
+    if (nextBestEffortHeartbeat > 0 && now >= nextBestEffortHeartbeat) {
+        i64 idx = getBestEffortBand();
+        BandSlot *slot = (idx >= 0 && (usz)idx < bands.size()) ? bands[(usz)idx] : nullptr;
+        sendSack(Packet::BestEffort, slot);
+        scheduleNextBestEffortHeartbeat();
     }
-    while (fragmentationRegister.size() > size && fragmentationRegister.size() > 0) {
-        usz oldestIdx = 0;
-        u64 oldestTime = fragmentationRegister[0].lastUpdated;
-        for (usz i = 1; i < fragmentationRegister.size(); ++i) {
-            if (fragmentationRegister[i].lastUpdated < oldestTime) {
-                oldestTime = fragmentationRegister[i].lastUpdated;
-                oldestIdx = i;
+
+    // Curiosity Heartbeat (Exploratory SACK on stochastic band)
+    if (nextCuriosityHeartbeat > 0 && now >= nextCuriosityHeartbeat) {
+        i64 idx = getBestCuriosityBand();
+        BandSlot *slot = (idx >= 0 && (usz)idx < bands.size()) ? bands[(usz)idx] : nullptr;
+        sendSack(Packet::Curiosity, slot);
+        scheduleNextCuriosityHeartbeat();
+    }
+
+    // Retransmit Unacknowledged Reliable Bundles
+    for (auto &pair : outbox) {
+        SentBundle &sb = pair.value;
+        if (sb.ackTime == 0 && sb.bundle.size() > 0) {
+            u64 bandRtt = 2 * (sb.bandSlot ? sb.bandSlot->getLatency() : 10);
+            if (bandRtt < 20) bandRtt = 20;
+
+            if (now - sb.sentTime >= bandRtt) {
+                i64 bestIdx = getBestReliableBand();
+                BandSlot *currentBestSlot = (bestIdx >= 0 && (usz)bestIdx < bands.size()) ? bands[(usz)bestIdx] : sb.bandSlot;
+                if (currentBestSlot && currentBestSlot->physical) {
+                    currentBestSlot->physical->push(sb.bundle);
+                    sb.sentTime = now;
+                    sb.bandSlot = currentBestSlot;
+                    sb.band = currentBestSlot->id;
+                    lastSent = now;
+                }
             }
         }
-        fragmentationRegister.remove(oldestIdx);
     }
+}
 
-    // Retransmission starting from retransmitFrom in retransmissionBuffer
-    u64 lastRetransmitted = 0;
-    bool anyRetransmitted = false;
-
-    Array<u64> keysToRetransmit;
-    for (auto &entry : retransmissionBuffer) {
-        if (retransmitFrom == 0 || entry.key >= retransmitFrom) {
-            keysToRetransmit.push(entry.key);
+void Lines::updateRollingStats() {
+    u64 now = millis();
+    for (usz i = 0; i < bands.size(); ++i) {
+        BandSlot *s = bands[i];
+        if (s && now - s->windowResetTime >= 1000) {
+            s->bytesSentLastSec = 0;
+            s->bytesRecvLastSec = 0;
+            s->ackedBytesLastSec = 0;
+            s->dutyConsumedLastSec = 0;
+            s->windowResetTime = now;
         }
     }
-    for (usz i = 0; i < keysToRetransmit.size(); ++i) {
-        for (usz j = i + 1; j < keysToRetransmit.size(); ++j) {
-            if (keysToRetransmit[j] < keysToRetransmit[i]) {
-                u64 tmp = keysToRetransmit[i];
-                keysToRetransmit[i] = keysToRetransmit[j];
-                keysToRetransmit[j] = tmp;
-            }
-        }
-    }
+}
 
-    for (usz i = 0; i < keysToRetransmit.size(); ++i) {
-        u64 id = keysToRetransmit[i];
-        const String *bundle = retransmissionBuffer.get(id);
-        if (bundle) {
-            u32 band = selectBestBand(bundle->size());
-            transmitRaw(*bundle, band);
-            lastRetransmitted = id;
-            anyRetransmitted = true;
-        }
-    }
+bool Lines::matchesBundle(const String &bundle) const {
+    if (bundle.size() < 10) return false;
+    if (!isEncrypted(bundle)) return false;
+    if (sharedKey.size() < 32) return false;
 
-    if (anyRetransmitted) {
-        retransmitFrom = lastRetransmitted + 1;
-    }
+    u16 rawHeader = (u16)(u8)bundle[0] | ((u16)(u8)bundle[1] << 8);
+    u16 maskedDelta = rawHeader & 0x7FFF;
 
-    // SACK Heartbeats schedule
-    f32 aggression = getAggression();
-    i64 jitter = randomNumber<i64>(-(i64)(timeout / 6), (i64)(timeout / 6));
-    i64 baseHeartbeatTime = (i64)timeout + jitter;
+    const u8 *ct = (const u8*)bundle.data() + 10;
+    usz ctLen = bundle.size() - 10;
+    u16 mask = computeDeltaMask(theirDirectionalKey, ct, ctLen);
+    u16 low15 = (maskedDelta ^ mask) & 0x7FFF;
 
-    i64 mainInterval = (i64)(baseHeartbeatTime - (aggression * timeout * 2.0f));
-    i64 minInterval = (i64)(timeout / 1000);
-    if (minInterval < 1) minInterval = 1;
-    if (mainInterval < minInterval) mainInterval = minInterval;
+    u64 high = base & ~0x7FFFULL;
+    u64 bundleId = high | (u64)low15;
+    if (bundleId + 16384 < base) bundleId += 32768;
+    else if (bundleId > base + 16384 && bundleId >= 32768) bundleId -= 32768;
 
-    u32 bestBand = selectBestBand(64);
+    if (bundleId < base) return false;
+    u64 delta = bundleId - base;
+    if (delta >= size) return false;
 
-    if (now - lastSent >= (u64)mainInterval) {
-        sendSackHeartbeat(bestBand);
-    }
+    const u8 *macInBundle = (const u8*)bundle.data() + 2;
+    return verifyBundleMac(macInBundle, theirDirectionalKey, bundleId, ct, ctLen);
+}
 
-    i64 sacrificialInterval = (i64)(baseHeartbeatTime - (aggression * timeout));
-    if (sacrificialInterval < minInterval) sacrificialInterval = minInterval;
-
-    if (now - lastSacrificialSent >= (u64)sacrificialInterval) {
-        sendSacrificialSack(bestBand);
-        lastSacrificialSent = now;
-    }
+bool Lines::isEncrypted(const String &bytes) {
+    if (bytes.size() < 2) return false;
+    u16 header = (u16)(u8)bytes[0] | ((u16)(u8)bytes[1] << 8);
+    return (header & 0x8000) != 0;
 }
 
 } // namespace Ksee

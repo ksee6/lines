@@ -1,7 +1,8 @@
 /**
  * @file Lines.hpp
- * @brief The Lines Protocol - A high-performance multiplexed, encrypted,
- * multi-band stochastic transport layer for Ksee.
+ * @brief The Lines Protocol - A high-performance, multi-band stochastic transport layer.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License").
  */
 
 #ifndef LINES_LINES_HPP
@@ -20,295 +21,424 @@
 #include <Ksee/Crypto/AEAD.hpp>
 #include <Ksee/Format/Yaml.hpp>
 #include <Ksee/Math/Random.hpp>
+#include <Ksee/Math/Interval.hpp>
 
 namespace Ksee {
 
-using Keypair = XKeypair;
-
-/**
- * @struct FromTo
- * @brief Represents a closed interval [from, to] for SACK heartbeats.
- */
-struct FromTo {
-    u64 from = 0;
-    u64 to = 0;
-
-    FromTo() = default;
-    FromTo(u64 f, u64 t) : from(f), to(t) {}
-};
-
-/**
- * @class Bitmap
- * @brief Dynamic bitset respecting arbitrary window sizes.
- */
-class Bitmap {
-public:
-    Array<u64> words;
-    usz numBits = 64;
-
-    Bitmap(usz bits = 64) {
-        resize(bits);
-    }
-
-    void resize(usz bits) {
-        numBits = (bits == 0) ? 64 : bits;
-        usz numWords = (numBits + 63) / 64;
-        words.allocate(numWords);
-        for (usz i = 0; i < words.size(); ++i) {
-            words[i] = 0;
-        }
-    }
-
-    void clear() {
-        for (usz i = 0; i < words.size(); ++i) {
-            words[i] = 0;
-        }
-    }
-
-    void reset() {
-        clear();
-    }
-
-    bool test(usz bit) const {
-        if (bit >= numBits) return false;
-        usz wordIdx = bit / 64;
-        usz bitIdx = bit % 64;
-        if (wordIdx >= words.size()) return false;
-        return (words[wordIdx] & (1ULL << bitIdx)) != 0;
-    }
-
-    void set(usz bit, bool value = true) {
-        if (bit >= numBits) {
-            resize(bit + 64);
-        }
-        usz wordIdx = bit / 64;
-        usz bitIdx = bit % 64;
-        if (wordIdx >= words.size()) return;
-        if (value) {
-            words[wordIdx] |= (1ULL << bitIdx);
-        } else {
-            words[wordIdx] &= ~(1ULL << bitIdx);
-        }
-    }
-
-    void shiftRight(usz count) {
-        if (count == 0) return;
-        if (count >= numBits) {
-            clear();
-            return;
-        }
-        usz wordShift = count / 64;
-        usz bitShift = count % 64;
-        usz numWords = words.size();
-
-        for (usz i = 0; i < numWords; ++i) {
-            usz src = i + wordShift;
-            u64 low = (src < numWords) ? (words[src] >> bitShift) : 0ULL;
-            u64 high = 0ULL;
-            if (bitShift > 0 && src + 1 < numWords) {
-                high = words[src + 1] << (64 - bitShift);
-            }
-            words[i] = low | high;
-        }
-    }
-
-    Bitmap &operator=(u64 val) {
-        clear();
-        if (words.size() > 0) words[0] = val;
-        return *this;
-    }
-
-    u64 operator&(u64 mask) const {
-        if (words.size() == 0) return 0;
-        return words[0] & mask;
-    }
-
-    Bitmap &operator>>=(u64 shift) {
-        shiftRight(shift);
-        return *this;
-    }
-
-    Bitmap &operator|=(u64 mask) {
-        if (words.size() > 0) words[0] |= mask;
-        return *this;
-    }
-
-    bool operator[](usz bit) const {
-        return test(bit);
-    }
-};
+class Lines;
+class PhysicalBand;
+struct BandSlot;
+struct SentBundle;
+struct RecvBundle;
 
 /**
  * @struct Packet
- * @brief Individual multiplexed data unit carried inside Lines bundles.
+ * @brief Multiplexed application data unit.
  */
 struct Packet {
-    u32 channel = 1;
+    enum Delivery : u8 {
+        Reliable = 0,    ///< Speed-routed, retransmitted, stored in outbox
+        BestEffort = 1,  ///< Min-latency routed, fire-and-forget, never retransmitted
+        Curiosity = 2    ///< Headroom-routed stochastic exploration probe
+    };
+
     String payload;
-    bool isImportant = true;
-    bool respectsHOL = true;
-    u8 fragState = 0;       ///< 0=none, 1=start, 2=middle, 3=end
-    u32 seriesId = 0;
-    u32 fragmentId = 0;
-    u32 channelSeq = 0;     ///< Per-channel sequence for HOL blocking
+    u64 channel = 1;
+    Delivery delivery = Reliable;
+    bool respectsOrder = true;
 
     Packet() = default;
-    Packet(u32 ch, const String &p, bool important = true, bool hol = true)
-        : channel(ch), payload(p), isImportant(important), respectsHOL(hol) {}
+
+    Packet(const String &p, u64 ch = 1, Delivery del = Reliable, bool order = true)
+        : payload(p), channel(ch), delivery(del), respectsOrder(order) {}
+
+    // Backwards-compatible constructor
+    Packet(u64 ch, const String &p, bool reliable = true, bool order = true)
+        : payload(p), channel(ch), delivery(reliable ? Reliable : BestEffort), respectsOrder(order) {}
+
+    bool isReliable() const { return delivery == Reliable; }
+    bool isBestEffort() const { return delivery == BestEffort; }
+    bool isCuriosity() const { return delivery == Curiosity; }
 };
 
 /**
- * @class FragmentRegisterEntry
- * @brief Tracks and reassembles incoming fragment series across stochastic datagrams.
+ * @struct BandSlot
+ * @brief Represents a logical slot connecting a Lines instance to a PhysicalBand.
  */
-class FragmentRegisterEntry {
+struct BandSlot {
+    PhysicalBand *physical = nullptr;
+    Lines *lines = nullptr;
+    u64 id = 1;
+
+    // Rolling statistics for this slot
+    u64 bytesSentLastSec = 0;
+    u64 bytesRecvLastSec = 0;
+    u64 ackedBytesLastSec = 0;
+    u64 dutyConsumedLastSec = 0;
+    u64 windowResetTime = 0;
+    u64 minObservedLatency = 0;
+
+    u64 getSendThroughput() const { return bytesSentLastSec; }
+    u64 getRecvThroughput() const { return bytesRecvLastSec; }
+    u64 getThroughput() const { return bytesSentLastSec + bytesRecvLastSec; }
+
+    u64 getSendCapacity() const {
+        if (dutyConsumedLastSec == 0) return ackedBytesLastSec * 1000;
+        return (ackedBytesLastSec * 1000) / dutyConsumedLastSec;
+    }
+
+    u64 getRecvCapacity() const { return bytesRecvLastSec; }
+
+    u64 getLatency() const {
+        return (minObservedLatency > 0) ? minObservedLatency : 1;
+    }
+
+    bool isAvailable() const;
+};
+
+/**
+ * @class PhysicalBand
+ * @brief Physical transmission medium with duty cycle limits, debt regeneration, and shared slot dispatch.
+ */
+class PhysicalBand {
 public:
-    u32 seriesId = 0;
-    u32 channel = 1;
-    bool respectsHol = true;
-    u32 channelSeq = 0;
-    bool hasStart = false;
-    bool hasEnd = false;
-    u32 endFragmentId = 0;
-    Map<u32, String> fragments;
-    u64 lastUpdated = 0;
+    u64 lastDebtRegenTime = 0;     ///< Deducts maxDuty from duty every second
+    u64 duty = 0;                  ///< Current debt in ms; may exceed maxDuty while transmitting a full packet
+    u64 maxDuty = 0;               ///< Duty cycle limit in ms per second (0 = infinite)
+    u64 stunnedUntil = 0;          ///< Backoff timestamp in millis
+    u64 idealCapacity = 0;         ///< Defaults to 0; favors curiosity packets stochastically
+    u64 maxBundleSize = 1400;      ///< Maximum bundle size allowed (0 = infinite)
 
-    FragmentRegisterEntry() = default;
+    Func<String()> recvCallback;
+    Func<void(String)> sendCallback;
 
-    bool isComplete() const;
-    String assemble() const;
+    Array<BandSlot*> slots;
+    bool isDynamicallyAllocated = false;
+
+    PhysicalBand();
+    ~PhysicalBand();
+
+    bool couldPush() const;
+    void stun(u64 duration = 0);
+    void push(const String &bundle);
+    void recv(const String &bundle);
+    void addSlot(BandSlot *slot);
+    void removeSlot(BandSlot *slot);
+    void update(bool doLinesUpdates = true);
+};
+
+/**
+ * @struct SentBundle
+ * @brief Metadata and payload tracked in outbox.
+ */
+struct SentBundle {
+    u64 sentTime = 0;
+    u64 ackTime = 0;               ///< in ms; 0 if unacknowledged
+    u64 duty = 0;                  ///< airtime in ms
+    u64 size = 0;                  ///< bundle wire size
+    String bundle;                 ///< Kept ONLY for Reliable delivery; empty for BestEffort/Curiosity
+    BandSlot *bandSlot = nullptr;  ///< the band slot we sent on
+    u64 band = 1;                  ///< legacy numeric ID alias
+    Packet::Delivery delivery = Packet::Reliable;
+};
+
+/**
+ * @struct RecvBundle
+ * @brief Reception record tracked in inbox.
+ */
+struct RecvBundle {
+    u64 recvTime = 0;
+    u64 size = 0;
+    BandSlot *bandSlot = nullptr;  ///< the band slot we received on
+    u64 band = 1;                  ///< legacy numeric ID alias
 };
 
 /**
  * @class Lines
- * @brief The core Lines protocol engine.
+ * @brief The Lines protocol engine.
  */
 class Lines {
 public:
     using Tree = Ksee::Tree<void>;
+    using BandSlot = Ksee::BandSlot;
 
-    // --- Cryptographic Identity & Handshake State ---
-    Keypair epheKeypair;             ///< Ephemeral keypair for session ECDH
-    u256 theirEphePublic;            ///< Peer ephemeral public key
-    Tree theirMetadata;              ///< Metadata received from peer
-    Tree metadata;                   ///< Local metadata to prove to peer
-    Tree selector;                   ///< Probing selector tree
-    Array<Keypair> staticKeypairs;   ///< Static keypairs to prove to peer
-    Array<String> theirStaticPublics;///< Static public keys proven by peer
-    Array<String> theirStatics;      ///< Synced alias for theirStaticPublics
+    // Window and Buffer constants
+    static constexpr u32 size = 64;
 
-    // --- Directional Session Keys & Configuration ---
-    String sharedKey;                ///< 32-byte shared root session key
-    u256 ourDirectionalKey;          ///< Direction-specific transmission key
-    u256 theirDirectionalKey;        ///< Direction-specific reception key
-    bool initiator = false;          ///< Whether local instance initiated handshake
-    u32 size = 64;                   ///< Window size and retransmission buffer capacity
-    u64 nonce = 2;                   ///< Last sent bundle nonce / ID
-    u64 base = 2;                    ///< Sliding window base bundle ID
-    Bitmap windowBitmap;             ///< Dynamic sliding window bitmap respecting size
-    u64 retransmitFrom = 0;          ///< Retransmission offset / cursor
+    // Cryptographic Identity & Handshake State
+    XKeypair epheKeypair;
+    u256 theirEphePublic;
+    Tree theirMetadata;
+    Array<XKeypair> staticKeypairs;
+    Array<String> theirStaticPublics;
+    Array<String> theirStatics;
 
-    u64 lastSeen = 0;                ///< Timestamp (millis) of last received bundle
-    u64 lastSent = 0;                ///< Timestamp (millis) of last sent bundle
-    u64 lastSacrificialSent = 0;     ///< Timestamp (millis) of last sacrificial heartbeat
-    u64 timeout = 20000;             ///< Milliseconds before automatic teardown
-    u32 paddingBlockSize = 32;       ///< Padding block size alignment (default 32 bytes)
+    // Session Keys & Directionality
+    String sharedKey;
+    u256 ourDirectionalKey;
+    u256 theirDirectionalKey;
+    bool initiator = false;
 
-    // --- Multi-Band Architecture ---
-    struct Band {
-        u32 id = 0;
-        Func<void(String)> sendCallback;
-        u64 weight = 1;              ///< Reception speed in bytes/sec (min 1 when active)
-        u32 mtu = 1024;              ///< Maximum transmission unit for this band
-        bool enabled = false;
-        bool occupied = false;
-        u64 bytesInInterval = 0;
-        u64 intervalStartTime = 0;
-    };
-    Map<u32, Band> bands;
+    // Silicon Sliding Window (Native 64-bit word)
+    u64 nonce = 2;
+    u64 base = 2;                      ///< Our receiving sliding window base
+    u64 sendBase = 2;                  ///< Peer's receive base (our outbox base)
+    u64 windowBitmap = 0;
+    u64 baseMoveTime = 0;
+    u64 retransmitFrom = 0;
 
-    // --- Transmission & Retransmission Buffers ---
-    Map<u64, String> retransmissionBuffer; ///< Unacknowledged important bundles
-    Array<Packet> pendingImportantQueue;
-    Array<Packet> pendingUnimportantQueue;
-    Array<FragmentRegisterEntry> fragmentationRegister;
+    // Buffer Backpressure & Pressure
+    Map<u64, SentBundle> outbox;
+    Map<u64, RecvBundle> inbox;
+    Map<u64, String> retransmissionBuffer; ///< Kept for backward compatibility
+    Array<Packet> toBeBundled;         ///< Staged pushes waiting to be bundled
 
-    // --- Channel Sequencing for Head-of-Line Blocking ---
+    // Timing & Metrics
+    String tune = "";                  ///< Pre-upgrade tuning tag; incorporates into CRC-15 with 0 wire bytes
+    u64 lastSeen = 0;
+    u64 lastSent = 0;
+    u64 upgradeTime = 0;
+    u64 timeout = 21300;               ///< Default 21.3s session timeout
+    u32 paddingBlockSize = 32;         ///< Block padding alignment (default 32 bytes)
+    u32 paddingSize = 32;              ///< Alias for paddingBlockSize
+    u64 maxThroughput = 0;             ///< 0 = unlimited
+
+    // Dual Heartbeat Schedulers
+    u64 nextBestEffortHeartbeat = 0;
+    u64 nextCuriosityHeartbeat = 0;
+
+    // Multi-Band Architecture
+    Array<BandSlot*> bands;
+    u64 primingBandSlot = 0;
+    u64 primingBand = 1;               ///< Backwards-compatible alias
+
+    // Channel Queues & Reordering
     struct ChannelSeq {
-        u32 nextExpected = 0;
-        Map<u32, Packet> holQueue;
+        u64 nextDeliverBundleId = 0;
+        Map<u64, Packet> holQueue;
     };
-    Map<u32, ChannelSeq> channelSequences;
-    Map<u32, u32> outgoingChannelSeq;
-    u32 nextFragmentationSeriesId = 1;
+    Map<u64, ChannelSeq> channelSequences;
 
-    // --- Callbacks ---
-    Func<bool()> onUpgrade;          ///< Triggered on server side on upgrade receipt
-    Func<void(Tree)> onDisconnect;   ///< Triggered when connection is severed
-    Func<void()> onReady;            ///< Triggered when encrypted channel is live
-    Func<bool(Tree)> onProbe;        ///< Triggered on server when probed
-    Func<bool()> onAnnounce;         ///< Triggered on client when announce arrives
-    Func<void(Packet)> onPacket;     ///< Triggered when application packet arrives
+    // Handshake Callback Wrappers
+    struct OnProbeHandler {
+        Func<bool(Tree, Tree&)> withMeta;
+        Func<bool(Tree)> simple;
 
-    // --- Lifecycle & Initialization ---
+        OnProbeHandler() = default;
+
+        template <typename F>
+        OnProbeHandler& operator=(F &&f) {
+            if constexpr (std::is_invocable_v<F, Tree, Tree&>) {
+                withMeta = [fn = std::forward<F>(f)](Tree sel, Tree &meta) -> bool { return (bool)fn(sel, meta); };
+                simple = nullptr;
+            } else if constexpr (std::is_invocable_v<F, Tree>) {
+                simple = [fn = std::forward<F>(f)](Tree sel) -> bool { return (bool)fn(sel); };
+                withMeta = nullptr;
+            } else if constexpr (std::is_invocable_v<F>) {
+                simple = [fn = std::forward<F>(f)](Tree) -> bool { return (bool)fn(); };
+                withMeta = nullptr;
+            }
+            return *this;
+        }
+
+        bool operator()(const Tree &sel, Tree &meta) const {
+            if (withMeta) return withMeta(sel, meta);
+            if (simple) return simple(sel);
+            return true;
+        }
+
+        explicit operator bool() const {
+            return (bool)withMeta || (bool)simple;
+        }
+    };
+
+    struct OnAnnounceHandler {
+        Func<bool(Tree)> withMeta;
+        Func<bool()> simple;
+
+        OnAnnounceHandler() = default;
+
+        template <typename F>
+        OnAnnounceHandler& operator=(F &&f) {
+            if constexpr (std::is_invocable_v<F, Tree>) {
+                withMeta = [fn = std::forward<F>(f)](Tree meta) -> bool { return (bool)fn(meta); };
+                simple = nullptr;
+            } else if constexpr (std::is_invocable_v<F>) {
+                simple = [fn = std::forward<F>(f)]() -> bool { return (bool)fn(); };
+                withMeta = nullptr;
+            }
+            return *this;
+        }
+
+        bool operator()(const Tree &meta) const {
+            if (withMeta) return withMeta(meta);
+            if (simple) return simple();
+            return true;
+        }
+
+        explicit operator bool() const {
+            return (bool)withMeta || (bool)simple;
+        }
+    };
+
+    struct OnUpgradeHandler {
+        Func<void(Tree)> withMeta;
+        Func<void()> simple;
+
+        OnUpgradeHandler() = default;
+
+        template <typename F>
+        OnUpgradeHandler& operator=(F &&f) {
+            if constexpr (std::is_invocable_v<F, Tree>) {
+                withMeta = [fn = std::forward<F>(f)](Tree t) { (void)fn(t); };
+                simple = nullptr;
+            } else if constexpr (std::is_invocable_v<F>) {
+                simple = [fn = std::forward<F>(f)]() { (void)fn(); };
+                withMeta = nullptr;
+            }
+            return *this;
+        }
+
+        void operator()(const Tree &meta) const {
+            if (withMeta) withMeta(meta);
+            else if (simple) simple();
+        }
+
+        explicit operator bool() const {
+            return (bool)withMeta || (bool)simple;
+        }
+    };
+
+    struct OnDisconnectHandler {
+        Func<void(Tree, bool)> withByUs;
+        Func<void(Tree)> simple;
+
+        OnDisconnectHandler() = default;
+
+        template <typename F>
+        OnDisconnectHandler& operator=(F &&f) {
+            if constexpr (std::is_invocable_v<F, Tree, bool>) {
+                withByUs = [fn = std::forward<F>(f)](Tree t, bool b) { (void)fn(t, b); };
+                simple = nullptr;
+            } else if constexpr (std::is_invocable_v<F, Tree>) {
+                simple = [fn = std::forward<F>(f)](Tree t) { (void)fn(t); };
+                withByUs = nullptr;
+            } else if constexpr (std::is_invocable_v<F>) {
+                simple = [fn = std::forward<F>(f)](Tree) { (void)fn(); };
+                withByUs = nullptr;
+            }
+            return *this;
+        }
+
+        void operator()(const Tree &reason, bool byUs) const {
+            if (withByUs) withByUs(reason, byUs);
+            else if (simple) simple(reason);
+        }
+
+        explicit operator bool() const {
+            return (bool)withByUs || (bool)simple;
+        }
+    };
+
+    // Callbacks
+    OnProbeHandler onProbe;
+    OnAnnounceHandler onAnnounce;
+    OnUpgradeHandler onUpgrade;
+    Func<void()> onReady;              ///< Backwards-compatible alias for onUpgrade
+    OnDisconnectHandler onDisconnect;
+    Func<void(Packet)> onPacket;
+    Func<void()> onDestroy;
+
     Lines();
     ~Lines();
 
-    bool isUpgraded() const { return sharedKey.size() > 0; }
-    void probe(const Tree &sel);
+    // Lifecycle
+    bool isUpgraded() const { return upgradeTime > 0; }
+    void probe(const Tree &sel = Tree());
+    void upgrade(const Tree &clientMetadata = Tree());
     void manualUpgrade(const String &key, bool isInitiator, u64 initialNonce = 2);
     void disconnect(const Tree &reason = Tree());
     void destroy();
 
-    // --- Multi-Band Management ---
-    void enable(Func<void(String)> callback, u32 band = 0, u64 initialWeight = 1, u32 mtu = 1024);
-    void disable(u32 band = 0);
-    f32 getAggression() const;
+    // Multi-Band Management
+    BandSlot* enable(Func<void(String)> sendCallback, Func<String()> recvCallback = nullptr);
+    BandSlot* enable(PhysicalBand &physicalBand);
+    BandSlot* enable(PhysicalBand *physicalBand);
+    BandSlot* enable(BandSlot *bandSlot);
+    BandSlot* enable();
+    BandSlot* enable(Func<void(String)> sendCallback, u64 legacyBandId, u64 initialWeight = 1, u64 maxBundleSize = 1400);
+
+    void disable(BandSlot *slot);
+    void disable(u64 bandSlotIdx);
+    void stun(BandSlot *slot, u64 duration = 0);
+    void stun(u64 bandSlotIdx = 0, u64 duration = 0);
+
+    // Band Routing Selectors (returns index in bands, or -1 on failure)
+    i64 getBestReliableBand() const;
+    i64 getBestEffortBand() const;
+    i64 getBestCuriosityBand() const;
+
+    // System-wide Metrics
+    u64 getSendThroughput() const;
+    u64 getRecvThroughput() const;
+    u64 getThroughput() const;
+    u64 getLatency() const;
+    f32 getPressure() const;
     bool couldPush() const;
-    u64 getWeight() const;
-    u64 getBandWeight(u32 band = 0) const;
 
-    // --- Data Transmission & Sliding Window ---
+    // Legacy Aliases for Test Compatibility
+    f32 getAggression() const { return getPressure(); }
+    u64 getWeight() const { return getSendThroughput(); }
+    u64 getBandWeight(u64 band) const;
+
+    // Transmission & Window Operations
     void push(const Packet &packet);
-    void pretendReceived(u64 from, u64 to);
-    Array<FromTo> showReceived() const;
-    Array<FromTo> showUnavailableToRetransmit() const;
+    void flushBundles();
+    void pretendReceived(u64 fromDelta, u64 toDelta);
+    void setAcknowledged(u64 fromDelta, u64 toDelta, u64 ackTime = 0);
+    void dropRetransmission(u64 fromDelta, u64 toDelta) {
+        setAcknowledged(fromDelta, toDelta, millis());
+    }
 
-    // --- Parsing & Roaming Engine ---
-    bool parse(const String &bundle, u32 band = 0);
+    Array<Interval<u64>> showReceived() const;
+    Array<Interval<u64>> showUnavailableToRetransmit() const;
+
+    // Scheduling
+    void scheduleNextBestEffortHeartbeat();
+    void scheduleNextCuriosityHeartbeat();
+    void sendSackHeartbeat(BandSlot *targetSlot = nullptr);
+    void sendSackHeartbeat(u64 targetBandSlotIdx);
+
+    // Wire Processing & Parsing
+    bool parse(const String &bundle, BandSlot *slot = nullptr);
+    bool parse(const String &bundle, u64 legacyBandId);
+    bool recv(const String &bundle, BandSlot *slot = nullptr) { return parse(bundle, slot); }
+    bool recv(const String &bundle, u64 legacyBandId) { return parse(bundle, legacyBandId); }
+
     bool matchesBundle(const String &bundle) const;
     static bool isEncrypted(const String &bytes);
 
-    // --- Periodic Scheduler & Retransmission ---
-    void update();
+    void update(bool callPBUpdates = true);
     void tick() { update(); }
-    void sendSackHeartbeat(u32 targetBand = 0);
 
 private:
+    u16 getTuneSeed() const;
     void setupDirectionalKeys();
-    u32 selectBestBand(u32 requiredPayloadSize) const;
-    void flushQueues();
-    void sendPostUpgradeBundle(bool important, u32 bandId);
-    void sendSacrificialSack(u32 excludeBand);
-    void transmitRaw(const String &bundle, u32 bandId);
+    void transmitBundle(u64 bundleId, const String &rawBundle, BandSlot *slot, Packet::Delivery delivery);
+    void sendPostUpgradeBundle(const Array<Packet> &packets, Packet::Delivery delivery, BandSlot *preferredSlot = nullptr);
+    void sendSack(Packet::Delivery delivery, BandSlot *targetSlot = nullptr);
     void advanceWindow(u64 newBase);
-    void dispatchPacket(const Packet &packet, u32 seq);
-    void updateBandReception(u32 bandId, usz bytesCount);
+    void advanceSendBase();
+    void dispatchPacket(const Packet &packet, u64 bundleId);
+    void updateRollingStats();
 
-    // Handshake packet handlers
-    void handleProbe(const String &payload, u32 bandId);
-    void handleAnnounce(const String &payload, u32 bandId);
-    void handleUpgrade(const String &payload, u32 bandId);
+    void handleProbe(const String &payload, BandSlot *slot);
+    void handleAnnounce(const String &payload, BandSlot *slot);
+    void handleUpgrade(const String &payload, BandSlot *slot);
     void handleDisconnect(const String &payload);
     void handleSack(const String &payload);
 };
 
 } // namespace Ksee
-
-// Global alias for compatibility
-using Lines = Ksee::Lines;
-using Packet = Ksee::Packet;
-using FromTo = Ksee::FromTo;
-using Bitmap = Ksee::Bitmap;
 
 #endif // LINES_LINES_HPP
