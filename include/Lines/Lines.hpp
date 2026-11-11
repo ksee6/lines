@@ -6,20 +6,20 @@
 #ifndef LINES_LINES_HPP
 #define LINES_LINES_HPP
 
-#include <Ksee/Types.hpp>
+#include <Ksee/Ksee.hpp>
 #include <Ksee/String.hpp>
 #include <Ksee/Array.hpp>
 #include <Ksee/Map.hpp>
 #include <Ksee/Func.hpp>
 #include <Ksee/Tree.hpp>
-#include <Ksee/Crypto/ECC.hpp>
-#include <Ksee/Crypto/Hash.hpp>
-#include <Ksee/Crypto/AEAD.hpp>
-#include <Ksee/Crypto/Chacha.hpp>
-#include <Ksee/Format/Yaml.hpp>
+#include <Ksee/Algorithm/ECC.hpp>
+#include <Ksee/Algorithm/Hash.hpp>
+#include <Ksee/Algorithm/AEAD.hpp>
+#include <Ksee/Algorithm/Chacha.hpp>
 #include <Ksee/Math/Random.hpp>
 #include <Ksee/Math/Interval.hpp>
-#include <Ksee/Resource/Comms.hpp>
+#include <Ksee/Comms/Packet.hpp>
+#include <Ksee/Comms/Band.hpp>
 
 namespace Ksee {
 
@@ -28,8 +28,8 @@ struct LinesBandSlot;
 struct SentBundle;
 struct RecvBundle;
 
-using Band = Ksee::Resource::Comms::Band;
-using Packet = Ksee::Resource::Comms::Packet;
+using Band = Ksee::Comms::Band;
+using Packet = Ksee::Comms::Packet;
 
 /**
  * @struct LinesBandSlot

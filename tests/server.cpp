@@ -8,7 +8,7 @@
 #include <poll.h>
 
 #include "Lines/Lines.hpp"
-#include <Ksee/Crypto/SHA.hpp>
+#include <Ksee/Algorithm/SHA.hpp>
 
 using namespace Ksee;
 using Lines = Ksee::Lines;
@@ -92,8 +92,7 @@ int main(int argc, char **argv) {
         return true;
     };
 
-    String serverReceivedData;
-    serverReceivedData.allocate(totalBytes);
+    String serverReceivedData(totalBytes, 0);
     usz serverBytesReceived = 0;
     bool hashVerified = false;
 

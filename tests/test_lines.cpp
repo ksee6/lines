@@ -9,7 +9,7 @@
 #include <assert.h>
 #include "../include/Lines/Lines.hpp"
 #include "../include/Lines/Patches.hpp"
-#include <Ksee/Crypto/SHA.hpp>
+#include <Ksee/Algorithm/SHA.hpp>
 
 using namespace Ksee;
 using Lines = Ksee::Lines;

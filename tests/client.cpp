@@ -8,7 +8,7 @@
 #include <poll.h>
 
 #include "Lines/Lines.hpp"
-#include <Ksee/Crypto/SHA.hpp>
+#include <Ksee/Algorithm/SHA.hpp>
 
 using namespace Ksee;
 using Lines = Ksee::Lines;
@@ -122,8 +122,7 @@ int main(int argc, char **argv) {
 
     // 2. Prepare 50MB payload and compute SHA-256
     printf("[Lines Client] Generating %d MB of test data...\n", totalMB);
-    String dataToSend;
-    dataToSend.allocate(totalBytes);
+    String dataToSend(totalBytes, 0);
     for (usz i = 0; i < totalBytes; ++i) {
         dataToSend[i] = (char)((i * 31 + 7) & 0xFF);
     }

@@ -36,9 +36,9 @@ static inline bool decodeVarInt(const u8 *data, usz len, usz &offset, u64 &out) 
 }
 
 static inline bool isPathPrefix(const Path &prefix, const Path &target) {
-    if (prefix.parts.size() > target.parts.size()) return false;
-    for (usz i = 0; i < prefix.parts.size(); ++i) {
-        if (prefix.parts[i] != target.parts[i]) return false;
+    if (prefix.size() > target.size()) return false;
+    for (usz i = 0; i < prefix.size(); ++i) {
+        if (prefix[i] != target[i]) return false;
     }
     return true;
 }
@@ -277,15 +277,15 @@ PatchOverride* Patches::findOverride(const Path &destination) {
             (patStr.endsWith(".") && dstStr.startsWith(patStr))) {
             return &overrides[i];
         }
-        if (destination.isIpv4() && overrides[i].pattern.parts.size() > 0 &&
-            (overrides[i].pattern.parts[0] == "4" || overrides[i].pattern.parts[0] == "3")) {
+        if (destination.isIpv4() && overrides[i].pattern.size() > 0 &&
+            (overrides[i].pattern[0] == "4" || overrides[i].pattern[0] == "3")) {
             return &overrides[i];
         }
-        if (destination.isIpv6() && overrides[i].pattern.parts.size() > 0 &&
-            (overrides[i].pattern.parts[0] == "6" || overrides[i].pattern.parts[0] == "4")) {
+        if (destination.isIpv6() && overrides[i].pattern.size() > 0 &&
+            (overrides[i].pattern[0] == "6" || overrides[i].pattern[0] == "4")) {
             return &overrides[i];
         }
-        if (overrides[i].pattern.common(destination) || isPathPrefix(overrides[i].pattern, destination)) {
+        if (overrides[i].pattern.common(destination) == destination || isPathPrefix(overrides[i].pattern, destination)) {
             return &overrides[i];
         }
     }
@@ -304,7 +304,7 @@ PatchConnection* Patches::findRoute(const Path &destination) const {
                 dstStr.startsWith(pStr + ".") ||
                 dstStr.startsWith(pStr + "/") ||
                 isPathPrefix(c->pathsRegisteredUnder[p], destination) ||
-                c->pathsRegisteredUnder[p].common(destination)) {
+                c->pathsRegisteredUnder[p].common(destination) == destination) {
                 return c;
             }
         }
@@ -330,7 +330,7 @@ bool Patches::hasCommonPath(PatchConnection *conn, const Path &source) const {
             srcStr.startsWith(pStr + ".") ||
             srcStr.startsWith(pStr + "/") ||
             isPathPrefix(conn->pathsRegisteredUnder[i], source) ||
-            conn->pathsRegisteredUnder[i].common(source)) {
+            conn->pathsRegisteredUnder[i].common(source) == source) {
             return true;
         }
     }

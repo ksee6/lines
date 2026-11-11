@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <cmath>
 #include <algorithm>
-#include <Ksee/Crypto/AEAD.hpp>
+#include <Ksee/Algorithm/AEAD.hpp>
 
 namespace Ksee {
 
@@ -65,8 +65,7 @@ static void computeBundleMac(u8 out8[8], const u256 &key, u64 bundleId, const u8
 
     // Stream bundleId (8 bytes little endian) followed by ciphertext
     u8 fullTag[16];
-    String authPayload;
-    authPayload.allocate(8 + len);
+    String authPayload(8 + len, 0);
     for (int i = 0; i < 8; ++i) {
         authPayload[i] = (char)(u8)(bundleId >> (i * 8));
     }
@@ -461,8 +460,7 @@ void Lines::probe(const Tree &sel) {
     // Single-packet Pre-Upgrade Bundle:
     // Header (2B): isEncrypted = 0 (bit 15), CRC-15-CAN (bits 14..0)
     // PacketHeader (1B): hasHandle = 0, respectsOrder = 0, isTheFinalPacketInThisBundle = 0, hasIntent = 0
-    String bundle;
-    bundle.allocate(3 + payload.size());
+    String bundle(3 + payload.size(), 0);
     bundle[0] = 0;
     bundle[1] = 0;
     bundle[2] = 0;
@@ -519,8 +517,7 @@ void Lines::upgrade(const Tree &clientMetadata) {
     payload.append(ciphertext.data(), ciphertext.size());
 
     // Build pre-upgrade packet
-    String bundle;
-    bundle.allocate(3 + payload.size());
+    String bundle(3 + payload.size(), 0);
     bundle[0] = 0;
     bundle[1] = 0;
     bundle[2] = 0;
@@ -685,8 +682,7 @@ void Lines::sendPostUpgradeBundle(const Array<Packet> &packets, bool reliable, b
     u16 maskedDelta = (low15 ^ mask) & 0x7FFF;
     u16 rawHeader = maskedDelta | 0x8000; // Bit 15 set for encrypted
 
-    String wire;
-    wire.allocate(10 + ciphertext.size());
+    String wire(10 + ciphertext.size(), 0);
     wire[0] = (char)(u8)(rawHeader & 0xFF);
     wire[1] = (char)(u8)((rawHeader >> 8) & 0xFF);
     for (int i = 0; i < 8; ++i) wire[2 + i] = (char)mac[i];
@@ -1179,8 +1175,7 @@ void Lines::handleProbe(const String &payload, LinesBandSlot *slot) {
     announcePayload.append((const char*)mac, 8);
     announcePayload.append(ciphertext.data(), ciphertext.size());
 
-    String bundle;
-    bundle.allocate(3 + announcePayload.size());
+    String bundle(3 + announcePayload.size(), 0);
     bundle[0] = 0;
     bundle[1] = 0;
     bundle[2] = 0;
