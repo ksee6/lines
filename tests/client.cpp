@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
 
     // Start handshake: probe
     Lines::Tree selector;
-    parseTree(R"({
+    parseYaml(R"({
         "name": "device.alpha",
         "version": 101,
         "protocol": "LinesUDP"
@@ -197,7 +197,7 @@ int main(int argc, char **argv) {
 
         // Graceful disconnect
         Lines::Tree reason;
-        parseTree(R"({
+        parseYaml(R"({
             "status": "completed",
             "code": 200,
             "message": "50mb_hash_verified",
