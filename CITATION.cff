@@ -5,10 +5,10 @@ authors:
     given-names: "Abderrahmene"
     alias: "Ksee"
     orcid: "https://orcid.org/0009-0002-7580-2748"
-title: "Lines"
+title: "Lines takes a stochastic datagram transport layer, and makes it a layer that is reliable, multiplexed, ultra-secure, un-analysable and tamper-resistant."
 url: "https://ksee.dev/lines"
 repository-code: "https://github.com/ksee6/lines"
 identifiers:
   - type: url
-    value: "https://ksee.dev/lines"
+    value: "https://ksee.dev/comms/lines"
     description: "Official Lines documentation and specification"
