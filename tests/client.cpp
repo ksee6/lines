@@ -12,8 +12,8 @@
 
 using namespace Ksee;
 using Lines = Ksee::Lines;
-using PhysicalBand = Ksee::PhysicalBand;
-using BandSlot = Ksee::BandSlot;
+using Band = Ksee::Band;
+using LinesBandSlot = Ksee::LinesBandSlot;
 using Packet = Ksee::Packet;
 using SentBundle = Ksee::SentBundle;
 using RecvBundle = Ksee::RecvBundle;
@@ -56,9 +56,12 @@ int main(int argc, char **argv) {
     printf("[Lines Client] Target UDP server at 127.0.0.1:%d (Preparing %d MB transfer)\n", port, totalMB);
 
     Lines client;
-    client.enable([&](String bundle) {
+    Band pb;
+    pb.sendCallback = [&](String bundle) {
         sendto(sockfd, bundle.data(), bundle.size(), 0, (sockaddr*)&serverAddr, sizeof(serverAddr));
-    }, /* band = */ 1, /* initialWeight = */ 100, /* maxBundleSize = */ 36000);
+    };
+    pb.maxBundleSize = 36000;
+    client.enable(pb);
 
     bool isReady = false;
     bool serverConfirmed = false;
@@ -68,18 +71,18 @@ int main(int argc, char **argv) {
         return true;
     };
 
-    client.onReady = [&]() {
-        printf("[Lines Client] Handshake complete! Post-upgrade channel is LIVE.\n");
+    client.onUpgrade = [&](Lines::Tree) {
+        printf("[Lines Client] Handshake complete! Post-upgrade session is LIVE.\n");
         isReady = true;
     };
 
     client.onPacket = [&](Packet packet) {
-        printf("[Lines Client] Received packet on channel %llu: '%.*s'\n",
-               (unsigned long long)packet.channel, (int)packet.payload.size(), packet.payload.c_str());
-        if (packet.channel == 1 && packet.payload == "HASH_OK") {
+        printf("[Lines Client] Received packet on handle %llu: '%.*s'\n",
+               (unsigned long long)packet.handle, (int)packet.payload.size(), packet.payload.c_str());
+        if (packet.handle == 1 && packet.payload == "HASH_OK") {
             serverConfirmed = true;
             printf("[Lines Client] Server confirmed 50MB hash match successfully!\n");
-        } else if (packet.channel == 1 && packet.payload == "HASH_ERR") {
+        } else if (packet.handle == 1 && packet.payload == "HASH_ERR") {
             printf("[Lines Client] ERROR: Server reported hash mismatch!\n");
         }
     };
@@ -107,7 +110,7 @@ int main(int argc, char **argv) {
         int ret = poll(&pfd, 1, 10);
         if (ret > 0 && (pfd.revents & POLLIN)) {
             ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), 0, nullptr, nullptr);
-            if (n > 0) client.parse(String((const u8*)buffer, (usz)n), 1);
+            if (n > 0) client.parse(String((const u8*)buffer, (usz)n));
         }
     }
 
@@ -142,13 +145,13 @@ int main(int argc, char **argv) {
         int pushedThisBatch = 0;
         while (sentBytes < totalBytes && client.couldPush() && pushedThisBatch < 8) {
             usz chunkSz = (totalBytes - sentBytes > chunkSize) ? chunkSize : (totalBytes - sentBytes);
-            client.push(Packet(1, String((const u8*)dataToSend.data() + sentBytes, chunkSz), true, true));
+            client.push(Packet(String((const u8*)dataToSend.data() + sentBytes, chunkSz), 1, 1, true, true));
             sentBytes += chunkSz;
             pushedThisBatch++;
         }
 
         if (sentBytes == totalBytes && !hashPushed && client.couldPush()) {
-            client.push(Packet(1, "HASH:" + clientHashHex, true, true));
+            client.push(Packet("HASH:" + clientHashHex, 1, 1, true, true));
             hashPushed = true;
             printf("[Lines Client] All %zu bytes pushed. Dispatched SHA-256 hash packet on Channel 1.\n", totalBytes);
         }
@@ -163,15 +166,15 @@ int main(int argc, char **argv) {
             while (true) {
                 ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), MSG_DONTWAIT, nullptr, nullptr);
                 if (n <= 0) break;
-                client.parse(String((const u8*)buffer, (usz)n), 1);
+                client.parse(String((const u8*)buffer, (usz)n));
             }
         }
 
         u64 now = millis();
         if (now - lastProgressPrint >= 1000) {
-            printf("[Lines Client Progress] sentBytes: %zu / %zu (%.1f%%), retransmissionBuf: %zu, couldPush: %d\n",
+            printf("[Lines Client Progress] sentBytes: %zu / %zu (%.1f%%), couldPush: %d\n",
                    sentBytes, totalBytes, (double)sentBytes * 100.0 / totalBytes,
-                   client.retransmissionBuffer.size(), (int)client.couldPush());
+                   (int)client.couldPush());
             lastProgressPrint = now;
         }
 

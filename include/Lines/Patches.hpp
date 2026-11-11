@@ -3,7 +3,7 @@
  * @brief The Patches Routing & Gateway Protocol.
  *
  * Sovereign fractal tree routing, multi-carrier BGP replacement,
- * cut-through channel switching, and protocol bridging built on top of Lines.
+ * cut-through target switching, and protocol bridging built on top of Lines.
  *
  * Licensed under the Apache License, Version 2.0 (the "License").
  */
@@ -34,9 +34,9 @@ struct PatchConnection {
 
 struct PatchCircuit {
     PatchConnection *inConn = nullptr;
-    u64 inChannel = 0;
+    u64 inTarget = 0;
     PatchConnection *outConn = nullptr;
-    u64 outChannel = 0;
+    u64 outTarget = 0;
     Path source;
     Path destination;
     bool isLocalOverride = false;
@@ -54,7 +54,7 @@ struct PatchSuggestion {
 
 class Patches : public Tree<void> {
 public:
-    Array<PhysicalBand*> physicalBands;
+    Array<Band*> bands;
     Path path;
     bool autoInferPath = true;
     XKeypair epheKeypair;
@@ -71,6 +71,7 @@ public:
     Func<Array<Path>(Lines &client, const Tree &metadata, const Array<Path> &selfProclaimedPath)> onUpgradeHandler;
     Func<bool(const Tree &selector, Tree &announceMetadata)> onProbeHandler;
     Func<bool(Lines &wouldBeClient, const Tree &metadata, const Array<String> &statics)> onAnnounceHandler;
+    Func<void(u64 target, const String &bundle)> onData;
 
     Patches();
     explicit Patches(const Path &p);
@@ -153,14 +154,14 @@ public:
     }
 
     // Media & Discovery
-    void addPhysicalBand(PhysicalBand *pb);
-    void addPhysicalBand(PhysicalBand &pb) { addPhysicalBand(&pb); }
+    void addBand(Band *b);
+    void addBand(Band &b) { addBand(&b); }
 
     void probe(const Tree &metadata = Tree());
     void announce(const Tree &metadata = Tree());
 
     // Circuit establishment & Transmission
-    bool open(const Path &destination, u64 localChannel = 2, u8 ttl = 255);
+    bool open(const Path &destination, u64 localTarget = 2, u8 ttl = 255);
     bool write(const Path &source, const Path &destination, const String &bundle, u8 ttl = 255);
     bool write(const Path &destination, const String &bundle, u8 ttl = 255) {
         return write(path.isEmpty() ? Path::Self : path, destination, bundle, ttl);
@@ -175,12 +176,12 @@ public:
 
 private:
     void setupLinesInstance(Lines *l);
-    void handleChannel1(PatchConnection *conn, const Packet &packet);
-    void handleDataChannel(PatchConnection *conn, const Packet &packet);
+    void handleTarget1(PatchConnection *conn, const Packet &packet);
+    void handleDataTarget(PatchConnection *conn, const Packet &packet);
     PatchConnection* findRoute(const Path &destination) const;
     PatchOverride* findOverride(const Path &destination);
     bool hasCommonPath(PatchConnection *conn, const Path &source) const;
-    u64 allocateLocalChannel(PatchConnection *conn);
+    u64 allocateLocalTarget(PatchConnection *conn);
     void setupClientHandlers(Lines *client, PatchConnection *conn);
 };
 

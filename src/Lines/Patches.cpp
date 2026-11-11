@@ -49,7 +49,7 @@ static inline bool isPathPrefix(const Path &prefix, const Path &target) {
 
 PatchConnection::~PatchConnection() {
     if (owned && lines) {
-        lines->destroy();
+        lines->reset();
         delete lines;
         lines = nullptr;
     }
@@ -104,15 +104,15 @@ void Patches::override(const Path &sourcePattern, Func<void(const Path &source, 
     overrides.push(ov);
 }
 
-void Patches::addPhysicalBand(PhysicalBand *pb) {
-    if (pb) physicalBands.push(pb);
+void Patches::addBand(Band *b) {
+    if (b) bands.push(b);
 }
 
 void Patches::setupLinesInstance(Lines *l) {
     if (!l) return;
     l->tune = "Patches";
-    for (usz i = 0; i < physicalBands.size(); ++i) {
-        if (physicalBands[i]) l->enable(*physicalBands[i]);
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i]) l->enable(*bands[i]);
     }
 }
 
@@ -134,10 +134,10 @@ PatchConnection* Patches::addConnection(Lines *lines, bool isUpstream, bool take
 
 void Patches::setupClientHandlers(Lines *client, PatchConnection *conn) {
     client->onPacket = [this, conn](Packet p) {
-        if (p.channel == 1) {
-            handleChannel1(conn, p);
+        if (p.handle == 1) {
+            handleTarget1(conn, p);
         } else {
-            handleDataChannel(conn, p);
+            handleDataTarget(conn, p);
         }
     };
 
@@ -190,7 +190,7 @@ void Patches::setupClientHandlers(Lines *client, PatchConnection *conn) {
             encodeVarInt(pStr.size(), msg);
             msg += pStr;
         }
-        client->push(Packet(msg, 1, Packet::BestEffort));
+        client->push(Packet(msg, 1, 1, false));
     };
 
     client->onDisconnect = [this, conn](Tree, bool) {
@@ -237,7 +237,7 @@ void Patches::probe(const Tree &metadata) {
 
     lines->onAnnounce = [this, lines](Tree serverMeta) {
         if (onAnnounceHandler && !onAnnounceHandler(*lines, serverMeta, lines->theirStaticPublics)) {
-            lines->destroy();
+            lines->reset();
             return false;
         }
         Tree clientMeta;
@@ -270,7 +270,13 @@ void Patches::announce(const Tree &metadata) {
 // ---------------------------------------------------------------------------
 
 PatchOverride* Patches::findOverride(const Path &destination) {
+    String dstStr = destination.toString();
     for (usz i = 0; i < overrides.size(); ++i) {
+        String patStr = overrides[i].pattern.toString();
+        if (dstStr == patStr || dstStr.startsWith(patStr + ".") || dstStr.startsWith(patStr + "/") ||
+            (patStr.endsWith(".") && dstStr.startsWith(patStr))) {
+            return &overrides[i];
+        }
         if (destination.isIpv4() && overrides[i].pattern.parts.size() > 0 &&
             (overrides[i].pattern.parts[0] == "4" || overrides[i].pattern.parts[0] == "3")) {
             return &overrides[i];
@@ -331,13 +337,13 @@ bool Patches::hasCommonPath(PatchConnection *conn, const Path &source) const {
     return false;
 }
 
-u64 Patches::allocateLocalChannel(PatchConnection *conn) {
+u64 Patches::allocateLocalTarget(PatchConnection *conn) {
     u64 candidate = 2;
     while (true) {
         bool used = false;
         for (usz i = 0; i < circuits.size(); ++i) {
-            if ((circuits[i].inConn == conn && circuits[i].inChannel == candidate) ||
-                (circuits[i].outConn == conn && circuits[i].outChannel == candidate)) {
+            if ((circuits[i].inConn == conn && circuits[i].inTarget == candidate) ||
+                (circuits[i].outConn == conn && circuits[i].outTarget == candidate)) {
                 used = true;
                 break;
             }
@@ -348,10 +354,10 @@ u64 Patches::allocateLocalChannel(PatchConnection *conn) {
 }
 
 // ---------------------------------------------------------------------------
-// Channel 1 Control Protocol Handling
+// Target 1 Control Protocol Handling
 // ---------------------------------------------------------------------------
 
-void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
+void Patches::handleTarget1(PatchConnection *conn, const Packet &packet) {
     const u8 *data = (const u8*)packet.payload.data();
     usz len = packet.payload.size();
     usz offset = 0;
@@ -398,8 +404,8 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
     if (action == 2) {
         if (offset >= len) return;
         u8 ttl = data[offset++];
-        u64 clientChannel = 0;
-        if (!decodeVarInt(data, len, offset, clientChannel)) return;
+        u64 clientTarget = 0;
+        if (!decodeVarInt(data, len, offset, clientTarget)) return;
 
         u64 srcLen = 0;
         if (!decodeVarInt(data, len, offset, srcLen) || offset + srcLen > len) return;
@@ -418,8 +424,8 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
         if (ttl == 0) {
             String err;
             encodeVarInt(4, err); // Action 4: Open Err
-            encodeVarInt(clientChannel, err);
-            conn->lines->push(Packet(err, 1, Packet::BestEffort));
+            encodeVarInt(clientTarget, err);
+            conn->lines->push(Packet(err, 1, 1, false));
             return;
         }
 
@@ -427,8 +433,8 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
         if (!hasCommonPath(conn, srcPath)) {
             String err;
             encodeVarInt(4, err);
-            encodeVarInt(clientChannel, err);
-            conn->lines->push(Packet(err, 1, Packet::BestEffort));
+            encodeVarInt(clientTarget, err);
+            conn->lines->push(Packet(err, 1, 1, false));
             return;
         }
 
@@ -437,9 +443,9 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
         if (ov) {
             PatchCircuit circ;
             circ.inConn = conn;
-            circ.inChannel = clientChannel;
+            circ.inTarget = clientTarget;
             circ.outConn = nullptr;
-            circ.outChannel = 0;
+            circ.outTarget = 0;
             circ.source = srcPath;
             circ.destination = dstPath;
             circ.isLocalOverride = true;
@@ -447,8 +453,8 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
 
             String ok;
             encodeVarInt(3, ok); // Action 3: Open OK
-            encodeVarInt(clientChannel, ok);
-            conn->lines->push(Packet(ok, 1, Packet::BestEffort));
+            encodeVarInt(clientTarget, ok);
+            conn->lines->push(Packet(ok, 1, 1, false));
             return;
         }
 
@@ -457,18 +463,18 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
         if (!nextHop || nextHop == conn) {
             String err;
             encodeVarInt(4, err);
-            encodeVarInt(clientChannel, err);
-            conn->lines->push(Packet(err, 1, Packet::BestEffort));
+            encodeVarInt(clientTarget, err);
+            conn->lines->push(Packet(err, 1, 1, false));
             return;
         }
 
-        u64 forwardChannel = allocateLocalChannel(nextHop);
+        u64 forwardTarget = allocateLocalTarget(nextHop);
 
         PatchCircuit circ;
         circ.inConn = conn;
-        circ.inChannel = clientChannel;
+        circ.inTarget = clientTarget;
         circ.outConn = nextHop;
-        circ.outChannel = forwardChannel;
+        circ.outTarget = forwardTarget;
         circ.source = srcPath;
         circ.destination = dstPath;
         circ.isLocalOverride = false;
@@ -478,27 +484,27 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
         String fwd;
         encodeVarInt(2, fwd);
         fwd.push((char)(ttl - 1));
-        encodeVarInt(forwardChannel, fwd);
+        encodeVarInt(forwardTarget, fwd);
         encodeVarInt(srcStr.size(), fwd);
         fwd += srcStr;
         encodeVarInt(dstStr.size(), fwd);
         fwd += dstStr;
-        nextHop->lines->push(Packet(fwd, 1, Packet::BestEffort));
+        nextHop->lines->push(Packet(fwd, 1, 1, false));
         return;
     }
 
     // Action 3: Open OK (Circuit Confirmed)
     if (action == 3) {
-        u64 channel = 0;
-        if (!decodeVarInt(data, len, offset, channel)) return;
+        u64 target = 0;
+        if (!decodeVarInt(data, len, offset, target)) return;
 
         for (usz i = 0; i < circuits.size(); ++i) {
-            if (circuits[i].outConn == conn && circuits[i].outChannel == channel) {
+            if (circuits[i].outConn == conn && circuits[i].outTarget == target) {
                 if (circuits[i].inConn && circuits[i].inConn->lines) {
                     String ok;
                     encodeVarInt(3, ok);
-                    encodeVarInt(circuits[i].inChannel, ok);
-                    circuits[i].inConn->lines->push(Packet(ok, 1, Packet::BestEffort));
+                    encodeVarInt(circuits[i].inTarget, ok);
+                    circuits[i].inConn->lines->push(Packet(ok, 1, 1, false));
                 }
                 return;
             }
@@ -508,17 +514,17 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
 
     // Action 4: Open Err (Circuit Failed)
     if (action == 4) {
-        u64 channel = 0;
-        if (!decodeVarInt(data, len, offset, channel)) return;
+        u64 target = 0;
+        if (!decodeVarInt(data, len, offset, target)) return;
 
         for (usz i = circuits.size(); i > 0; --i) {
             usz idx = i - 1;
-            if (circuits[idx].outConn == conn && circuits[idx].outChannel == channel) {
+            if (circuits[idx].outConn == conn && circuits[idx].outTarget == target) {
                 if (circuits[idx].inConn && circuits[idx].inConn->lines) {
                     String err;
                     encodeVarInt(4, err);
-                    encodeVarInt(circuits[idx].inChannel, err);
-                    circuits[idx].inConn->lines->push(Packet(err, 1, Packet::BestEffort));
+                    encodeVarInt(circuits[idx].inTarget, err);
+                    circuits[idx].inConn->lines->push(Packet(err, 1, 1, false));
                 }
                 circuits.remove(idx);
                 return;
@@ -529,15 +535,15 @@ void Patches::handleChannel1(PatchConnection *conn, const Packet &packet) {
 }
 
 // ---------------------------------------------------------------------------
-// Cut-Through Data Plane Switching (Channels >= 2)
+// Cut-Through Data Plane Switching (Targets >= 2)
 // ---------------------------------------------------------------------------
 
-void Patches::handleDataChannel(PatchConnection *conn, const Packet &packet) {
+void Patches::handleDataTarget(PatchConnection *conn, const Packet &packet) {
     for (usz i = 0; i < circuits.size(); ++i) {
         PatchCircuit &c = circuits[i];
 
         // Inbound -> Outbound
-        if (c.inConn == conn && c.inChannel == packet.channel) {
+        if (c.inConn == conn && c.inTarget == packet.handle) {
             if (c.isLocalOverride) {
                 PatchOverride *ov = findOverride(c.destination);
                 if (ov) {
@@ -546,18 +552,24 @@ void Patches::handleDataChannel(PatchConnection *conn, const Packet &packet) {
                 return;
             }
             if (c.outConn && c.outConn->lines) {
-                c.outConn->lines->push(Packet(packet.payload, c.outChannel, Packet::BestEffort));
+                c.outConn->lines->push(Packet(packet.payload, c.outTarget, 1, false));
             }
             return;
         }
 
         // Outbound -> Inbound (Reverse direction)
-        if (c.outConn == conn && c.outChannel == packet.channel) {
+        if (c.outConn == conn && c.outTarget == packet.handle) {
             if (c.inConn && c.inConn->lines) {
-                c.inConn->lines->push(Packet(packet.payload, c.inChannel, Packet::BestEffort));
+                c.inConn->lines->push(Packet(packet.payload, c.inTarget, 1, false));
+            } else if (onData) {
+                onData(c.outTarget, packet.payload);
             }
             return;
         }
+    }
+
+    if (onData) {
+        onData(packet.handle, packet.payload);
     }
 }
 
@@ -565,16 +577,16 @@ void Patches::handleDataChannel(PatchConnection *conn, const Packet &packet) {
 // Manual Circuit Opening & Transmission
 // ---------------------------------------------------------------------------
 
-bool Patches::open(const Path &destination, u64 localChannel, u8 ttl) {
-    if (localChannel < 2) return false;
+bool Patches::open(const Path &destination, u64 localTarget, u8 ttl) {
+    if (localTarget < 2) return false;
 
     PatchOverride *ov = findOverride(destination);
     if (ov) {
         PatchCircuit circ;
         circ.inConn = nullptr;
-        circ.inChannel = localChannel;
+        circ.inTarget = localTarget;
         circ.outConn = nullptr;
-        circ.outChannel = localChannel;
+        circ.outTarget = localTarget;
         circ.source = path.isEmpty() ? Path::Self : path;
         circ.destination = destination;
         circ.isLocalOverride = true;
@@ -587,9 +599,9 @@ bool Patches::open(const Path &destination, u64 localChannel, u8 ttl) {
 
     PatchCircuit circ;
     circ.inConn = nullptr;
-    circ.inChannel = localChannel;
+    circ.inTarget = localTarget;
     circ.outConn = nextHop;
-    circ.outChannel = localChannel;
+    circ.outTarget = localTarget;
     circ.source = path.isEmpty() ? Path::Self : path;
     circ.destination = destination;
     circ.isLocalOverride = false;
@@ -598,13 +610,13 @@ bool Patches::open(const Path &destination, u64 localChannel, u8 ttl) {
     String openPkt;
     encodeVarInt(2, openPkt); // Action 2: Open
     openPkt.push((char)ttl);
-    encodeVarInt(localChannel, openPkt);
+    encodeVarInt(localTarget, openPkt);
     String srcStr = circ.source.toString();
     String dstStr = destination.toString();
     encodeVarInt(srcStr.size(), openPkt); openPkt += srcStr;
     encodeVarInt(dstStr.size(), openPkt); openPkt += dstStr;
 
-    nextHop->lines->push(Packet(openPkt, 1, Packet::BestEffort));
+    nextHop->lines->push(Packet(openPkt, 1, 1, false));
     return true;
 }
 
@@ -624,19 +636,19 @@ bool Patches::write(const Path &source, const Path &destination, const String &b
                 return true;
             }
             if (circuits[i].outConn && circuits[i].outConn->lines) {
-                circuits[i].outConn->lines->push(Packet(bundle, circuits[i].outChannel, Packet::BestEffort));
+                circuits[i].outConn->lines->push(Packet(bundle, circuits[i].outTarget, 1, false));
                 return true;
             }
         }
     }
 
-    // 3. Fallback: find route, open circuit on channel 2 and transmit
+    // 3. Fallback: find route, open circuit on target 2 and transmit
     PatchConnection *nextHop = findRoute(destination);
     if (!nextHop || !nextHop->lines) return false;
 
-    u64 channel = allocateLocalChannel(nextHop);
-    open(destination, channel, ttl);
-    nextHop->lines->push(Packet(bundle, channel, Packet::BestEffort));
+    u64 target = allocateLocalTarget(nextHop);
+    open(destination, target, ttl);
+    nextHop->lines->push(Packet(bundle, target, 1, false));
     return true;
 }
 
@@ -645,9 +657,9 @@ bool Patches::write(const Path &source, const Path &destination, const String &b
 // ---------------------------------------------------------------------------
 
 void Patches::update() {
-    // Update physical bands
-    for (usz i = 0; i < physicalBands.size(); ++i) {
-        if (physicalBands[i]) physicalBands[i]->update(false);
+    // Update bands
+    for (usz i = 0; i < bands.size(); ++i) {
+        if (bands[i]) bands[i]->update(false);
     }
 
     // Update Lines connections

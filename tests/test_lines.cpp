@@ -13,8 +13,8 @@
 
 using namespace Ksee;
 using Lines = Ksee::Lines;
-using PhysicalBand = Ksee::PhysicalBand;
-using BandSlot = Ksee::BandSlot;
+using Band = Ksee::Band;
+using LinesBandSlot = Ksee::LinesBandSlot;
 using Packet = Ksee::Packet;
 using SentBundle = Ksee::SentBundle;
 using RecvBundle = Ksee::RecvBundle;
@@ -26,7 +26,7 @@ static void test_wire_framing_and_crc() {
 
     Lines client;
     String capturedWire;
-    client.enable([&](String b) { capturedWire = b; }, 1);
+    client.enable([&](String b) { capturedWire = b; });
 
     // 1. Pre-Upgrade Probe Wire Check
     Lines::Tree sel;
@@ -46,7 +46,7 @@ static void test_wire_framing_and_crc() {
     peer.manualUpgrade("32_byte_secret_key_testing_10b__", false, 2);
 
     capturedWire.clear();
-    client.push(Packet(1, String("Minimal packet"), true, true));
+    client.push(Packet(String("Minimal packet"), 1, 1, true, true));
     assert(capturedWire.size() >= 10);
     assert(Lines::isEncrypted(capturedWire));
 
@@ -55,7 +55,7 @@ static void test_wire_framing_and_crc() {
     assert((postHeader & 0x8000) != 0); // isEncrypted bit is 1
 
     // Verify MAC & decryption on peer
-    bool parsed = peer.parse(capturedWire, 1);
+    bool parsed = peer.parse(capturedWire);
     assert(parsed);
 
     printf("  -> Pre-upgrade (CRC-15) and Post-upgrade (10-byte MAC+Delta) verified.\n");
@@ -70,8 +70,8 @@ static void test_handshake_lifecycle() {
     String clientWire;
     String serverWire;
 
-    client.enable([&](String b) { clientWire = b; }, 1);
-    server.enable([&](String b) { serverWire = b; }, 1);
+    client.enable([&](String b) { clientWire = b; });
+    server.enable([&](String b) { serverWire = b; });
 
     bool probed = false;
     server.onProbe = [&](Lines::Tree sel) -> bool {
@@ -86,10 +86,10 @@ static void test_handshake_lifecycle() {
     };
 
     bool clientUpgraded = false;
-    client.onUpgrade = [&]() -> bool { clientUpgraded = true; return true; };
+    client.onUpgrade = [&](Lines::Tree) { clientUpgraded = true; };
 
     bool serverUpgraded = false;
-    server.onUpgrade = [&]() -> bool { serverUpgraded = true; return true; };
+    server.onUpgrade = [&](Lines::Tree) { serverUpgraded = true; };
 
     // 1. Client probes
     Lines::Tree selector;
@@ -98,20 +98,20 @@ static void test_handshake_lifecycle() {
     assert(clientWire.size() > 0);
 
     // 2. Server receives probe -> dispatches Announce
-    bool handledProbe = server.parse(clientWire, 1);
+    bool handledProbe = server.parse(clientWire);
     assert(handledProbe);
     assert(probed);
     assert(serverWire.size() > 0);
 
     // 3. Client receives Announce -> dispatches Upgrade
-    bool handledAnnounce = client.parse(serverWire, 1);
+    bool handledAnnounce = client.parse(serverWire);
     assert(handledAnnounce);
     assert(announced);
     assert(clientUpgraded);
     assert(client.isUpgraded());
 
     // 4. Server receives Upgrade -> connection live!
-    bool handledUpgrade = server.parse(clientWire, 1);
+    bool handledUpgrade = server.parse(clientWire);
     assert(handledUpgrade);
     assert(serverUpgraded);
     assert(server.isUpgraded());
@@ -120,35 +120,58 @@ static void test_handshake_lifecycle() {
 }
 
 static void test_delivery_modes_and_outbox() {
-    printf("[TEST 3] Delivery Modes (Reliable, BestEffort, Curiosity) & Outbox Retention...\n");
+    printf("[TEST 3] Packet Delivery Flags (Reliable, Ordered, Sacrificial) & Outbox Retention...\n");
 
     Lines client;
     String capturedWire;
-    client.enable([&](String b) { capturedWire = b; }, 1);
+    client.enable([&](String b) { capturedWire = b; });
     client.manualUpgrade("32_byte_secret_key_modes_test___", true, 2);
 
-    // 1. Reliable Delivery: must retain bundle payload in outbox for retransmission
-    Packet reliableP(String("Important RPC"), 1, Packet::Reliable);
-    client.push(reliableP);
+    // 1. Reliable & Ordered (default) -> must retain payload in outbox
+    Packet steadyP(String("Important RPC"), 1, 1, true, true, false);
+    assert(steadyP.ordered);
+    assert(steadyP.reliable);
+    assert(!steadyP.sacrificial);
+    client.push(steadyP);
     assert(client.outbox.has(2));
     assert(client.outbox[2].bundle.size() > 0);
-    assert(client.outbox[2].delivery == Packet::Reliable);
+    assert(client.outbox[2].reliable);
+    assert(!client.outbox[2].sacrificial);
 
-    // 2. BestEffort Delivery: must drop bundle payload immediately from outbox
-    Packet bestEffortP(String("Player Position (x=10, y=20)"), 1, Packet::BestEffort);
-    client.push(bestEffortP);
+    // 2. Reliable & Unordered -> retains payload in outbox
+    Packet swiftP(String("Emergency Stop"), 1, 1, true, false, false);
+    assert(!swiftP.ordered);
+    assert(swiftP.reliable);
+    assert(!swiftP.sacrificial);
+    client.push(swiftP);
     assert(client.outbox.has(3));
-    assert(client.outbox[3].bundle.size() == 0); // No payload stored!
-    assert(client.outbox[3].delivery == Packet::BestEffort);
+    assert(client.outbox[3].bundle.size() > 0); // Retained for retransmission!
+    assert(client.outbox[3].reliable);
+    assert(!client.outbox[3].sacrificial);
 
-    // 3. Curiosity Delivery: must drop bundle payload immediately
-    Packet curiosityP(String("Link Probe Ping"), 1, Packet::Curiosity);
-    client.push(curiosityP);
+    // 3. Unreliable & Unordered -> dropped immediately from outbox
+    Packet fleetingP(String("Player Position (x=10, y=20)"), 1, 1, false, false, false);
+    assert(!fleetingP.ordered);
+    assert(!fleetingP.reliable);
+    assert(!fleetingP.sacrificial);
+    client.push(fleetingP);
     assert(client.outbox.has(4));
-    assert(client.outbox[4].bundle.size() == 0);
-    assert(client.outbox[4].delivery == Packet::Curiosity);
+    assert(client.outbox[4].bundle.size() == 0); // No payload stored!
+    assert(!client.outbox[4].reliable);
+    assert(!client.outbox[4].sacrificial);
 
-    printf("  -> Reliable, BestEffort, and Curiosity outbox semantics verified.\n");
+    // 4. Sacrificial exploration probe -> dropped immediately from outbox
+    Packet curiousP(String("Link Probe Ping"), 1, 1, false, false, true);
+    assert(!curiousP.ordered);
+    assert(!curiousP.reliable);
+    assert(curiousP.sacrificial);
+    client.push(curiousP);
+    assert(client.outbox.has(5));
+    assert(client.outbox[5].bundle.size() == 0);
+    assert(!client.outbox[5].reliable);
+    assert(client.outbox[5].sacrificial);
+
+    printf("  -> Delivery flags (Reliable, Ordered, Sacrificial) & Outbox verified.\n");
 }
 
 static void test_sliding_window_silicon_native() {
@@ -161,21 +184,21 @@ static void test_sliding_window_silicon_native() {
     server.manualUpgrade(secret, false, 2);
 
     String capturedBundle;
-    client.enable([&](String b) { capturedBundle = b; }, 1);
+    client.enable([&](String b) { capturedBundle = b; });
 
-    client.push(Packet(1, String("Bundle #2"), true, true));
+    client.push(Packet(String("Bundle #2"), 1, 1, true, true));
 
     // 1. Valid bundle parses successfully
-    assert(server.parse(capturedBundle, 1));
+    assert(server.parse(capturedBundle));
 
     // 2. Replay attack: identical bundle is instantly rejected
-    assert(!server.parse(capturedBundle, 1));
+    assert(!server.parse(capturedBundle));
 
     // 3. Tampered ciphertext is rejected
-    client.push(Packet(1, String("Bundle #3"), true, true));
+    client.push(Packet(String("Bundle #3"), 1, 1, true, true));
     String tampered = capturedBundle;
     tampered[tampered.size() - 1] ^= 0x55;
-    assert(!server.parse(tampered, 1));
+    assert(!server.parse(tampered));
 
     printf("  -> Native 64-bit window & anti-replay protection verified.\n");
 }
@@ -185,14 +208,14 @@ static void test_pressure_and_backpressure() {
 
     Lines client;
     client.manualUpgrade("32_byte_secret_pressure_test____", true, 2);
-    client.enable([](String) {}, 1);
+    client.enable([](String) {});
 
     assert(client.getPressure() == 0.0f);
     assert(client.couldPush());
 
     // Push 32 unacknowledged reliable packets -> pressure should be 32/64 = 0.5f
     for (int i = 0; i < 32; ++i) {
-        client.push(Packet(1, String("Bulk data"), true, true));
+        client.push(Packet(String("Bulk data"), 1, 1, true, true));
     }
     f32 p = client.getPressure();
     assert(p >= 0.49f && p <= 0.51f);
@@ -207,9 +230,19 @@ static void test_pressure_and_backpressure() {
 static void test_multiband_metrics_and_collision_stun() {
     printf("[TEST 6] Band Metrics & Collision Stun Backoff...\n");
 
+    Band pb1;
+    pb1.sendCallback = [](String) {};
+    pb1.idealCapacity = 100;
+    pb1.maxBundleSize = 1400;
+
+    Band pb2;
+    pb2.sendCallback = [](String) {};
+    pb2.idealCapacity = 500;
+    pb2.maxBundleSize = 255;
+
     Lines lines;
-    BandSlot *slot1 = lines.enable([](String) {}, 1, /* initialWeight = */ 100, /* maxBundleSize = */ 1400);
-    BandSlot *slot2 = lines.enable([](String) {}, 2, /* initialWeight = */ 500, /* maxBundleSize = */ 255);
+    LinesBandSlot *slot1 = lines.enable(pb1);
+    LinesBandSlot *slot2 = lines.enable(pb2);
 
     assert(lines.bands.size() == 2);
     assert(slot1->isAvailable());
@@ -217,27 +250,26 @@ static void test_multiband_metrics_and_collision_stun() {
 
     // Band metrics, priming band & speed-based discovery
     lines.primingBandSlot = 0;
-    assert(lines.getBestReliableBand() == 0); // Speeds are 0 -> returns primingBandSlot (0)
+    assert(lines.getBestBand() == 0); // Speeds are 0 -> returns primingBandSlot (0)
 
     // Simulate Band 2 transmitting and receiving ACK (faster throughput)
     slot2->ackedBytesLastSec = 500000;
     slot2->dutyConsumedLastSec = 100; // 5 MB/s send capacity
-    assert(lines.getBestReliableBand() == 1); // Discovered faster band (index 1)!
+    assert(lines.getBestBand() == 1); // Discovered faster band (index 1)!
 
-    // Lowest latency routing for BestEffort
-    slot1->minObservedLatency = 5;  // 5ms
-    slot2->minObservedLatency = 20; // 20ms
-    assert(lines.getBestEffortBand() == 0);  // Routes to lowest latency band (index 0)
+    // Test getPotential() calculation
+    slot2->band->idealCapacity = 10000000; // 10 MB/s ideal
+    assert(slot2->getPotential() == 5000000); // 10 MB/s - 5 MB/s = 5 MB/s potential
 
     // Curiosity discovery routing
-    i64 curiosityBand = lines.getBestCuriosityBand();
-    assert(curiosityBand == 0 || curiosityBand == 1);
+    i64 unexploredBand = lines.selectUnexploredBand(2);
+    assert(unexploredBand == 0 || unexploredBand == 1);
 
     // Test collision stun backoff
     lines.stun(slot1, 50); // Stun band 1 for 50ms
     assert(!slot1->isAvailable());
     assert(slot2->isAvailable());
-    assert(lines.getBestEffortBand() == 1); // Band 1 is stunned -> falls back to available band 2 (index 1)
+    assert(lines.getBestBand() == 1); // Band 1 is stunned -> falls back to available band 2 (index 1)
 
     // Max bundle size enforcement on parse
     lines.manualUpgrade("32_byte_secret_stun_test________", true, 2);
@@ -262,8 +294,8 @@ static void test_connection_roaming_fast_filter() {
     serverB.manualUpgrade("client_b_secret_key_32_bytes____", false, 2);
 
     String bundleA;
-    clientA.enable([&](String b) { bundleA = b; }, 1);
-    clientA.push(Packet(1, String("Packet from client A"), true, true));
+    clientA.enable([&](String b) { bundleA = b; });
+    clientA.push(Packet(String("Packet from client A"), 1, 1, true, true));
 
     // Server A matches bundle A in 1 cycle
     assert(serverA.matchesBundle(bundleA));
@@ -283,12 +315,12 @@ static void test_disjoint_sack_and_pretend_intervals() {
     server.manualUpgrade(secret, false, 2);
 
     String clientWire;
-    client.enable([&](String b) { clientWire = b; }, 1);
+    client.enable([&](String b) { clientWire = b; });
 
     // Send bundles 2, 3, 4
-    client.push(Packet(1, String("Msg 2"), true, true));
-    client.push(Packet(1, String("Msg 3"), true, true));
-    client.push(Packet(1, String("Msg 4"), true, true));
+    client.push(Packet(String("Msg 2"), 1, 1, true, true));
+    client.push(Packet(String("Msg 3"), 1, 1, true, true));
+    client.push(Packet(String("Msg 4"), 1, 1, true, true));
 
     assert(client.outbox.has(2) && client.outbox[2].ackTime == 0);
     assert(client.outbox.has(3) && client.outbox[3].ackTime == 0);
@@ -313,17 +345,17 @@ static void test_padding_block_size_alignment() {
     Lines client;
     client.manualUpgrade("32_byte_secret_padding_test_____", true, 2);
     String wire;
-    client.enable([&](String b) { wire = b; }, 1);
+    client.enable([&](String b) { wire = b; });
 
     client.paddingBlockSize = 32;
-    client.push(Packet(1, String("Short text"), true, true));
+    client.push(Packet(String("Short text"), 1, 1, true, true));
 
     assert(wire.size() >= 10);
     usz ctLen = wire.size() - 10;
     assert(ctLen % 32 == 0);
 
     client.paddingBlockSize = 64;
-    client.push(Packet(1, String("Another short text"), true, true));
+    client.push(Packet(String("Another short text"), 1, 1, true, true));
     ctLen = wire.size() - 10;
     assert(ctLen % 64 == 0);
 
@@ -341,10 +373,10 @@ static void test_untrusted_gateway_onion_relaying() {
     cloudServer.manualUpgrade(e2eSecret, false, 2);
 
     String innerPacketWire;
-    sensor.enable([&](String b) { innerPacketWire = b; }, 1);
+    sensor.enable([&](String b) { innerPacketWire = b; });
 
     // Sensor creates inner encrypted packet
-    sensor.push(Packet(1, String("Sensor Telemetry: Temp=24.5C"), true, true));
+    sensor.push(Packet(String("Sensor Telemetry: Temp=24.5C"), 1, 1, true, true));
     assert(innerPacketWire.size() > 0);
     assert(Lines::isEncrypted(innerPacketWire));
 
@@ -354,19 +386,19 @@ static void test_untrusted_gateway_onion_relaying() {
     String hopSecret = "sensor_to_gateway_hop_secret_32_";
     gatewayInbound.manualUpgrade(hopSecret, false, 2);
 
-    // Wrap inner packet inside outer BestEffort packet
+    // Wrap inner packet inside outer packet
     Lines sensorHop;
     sensorHop.manualUpgrade(hopSecret, true, 2);
     String outerBundleWire;
-    sensorHop.enable([&](String b) { outerBundleWire = b; }, 1);
-    sensorHop.push(Packet(innerPacketWire, 1, Packet::BestEffort));
+    sensorHop.enable([&](String b) { outerBundleWire = b; });
+    sensorHop.push(Packet(innerPacketWire, 1, 1, false));
 
     // Gateway receives outer bundle, extracts inner payload
     String forwardedPayload;
     gatewayInbound.onPacket = [&](Packet p) {
         forwardedPayload = p.payload;
     };
-    bool gwOk = gatewayInbound.parse(outerBundleWire, 1);
+    bool gwOk = gatewayInbound.parse(outerBundleWire);
     assert(gwOk);
     assert(forwardedPayload == innerPacketWire);
 
@@ -375,7 +407,7 @@ static void test_untrusted_gateway_onion_relaying() {
     cloudServer.onPacket = [&](Packet p) {
         serverReceivedData = p.payload;
     };
-    bool srvOk = cloudServer.parse(forwardedPayload, 1);
+    bool srvOk = cloudServer.parse(forwardedPayload);
     assert(srvOk);
     assert(serverReceivedData == "Sensor Telemetry: Temp=24.5C");
 
@@ -383,10 +415,10 @@ static void test_untrusted_gateway_onion_relaying() {
 }
 
 static void test_physical_band_duty_and_shared_slots() {
-    printf("[TEST 11] PhysicalBand Duty Cycle Debt, Regeneration & Shared Slot Dispatch...\n");
+    printf("[TEST 11] Band Duty Cycle Debt, Regeneration & Shared Slot Dispatch...\n");
 
-    // 1. Create PhysicalBand with 10% duty limit (100ms per second)
-    PhysicalBand pb;
+    // 1. Create Band with 10% duty limit (100ms per second)
+    Band pb;
     pb.maxDuty = 100;
     pb.maxBundleSize = 500;
     assert(pb.couldPush());
@@ -399,21 +431,21 @@ static void test_physical_band_duty_and_shared_slots() {
 
     // Debt regeneration: simulate 1 second elapsed
     pb.lastDebtRegenTime = millis() - 1000;
-    pb.update(/* doLinesUpdates = */ false);
+    pb.update(/* doSlotUpdates = */ false);
     assert(pb.duty == 0); // 100 - 100 = 0
     assert(pb.couldPush());
 
-    // 2. Shared Slots: Two Lines instances share ONE PhysicalBand transceiver
+    // 2. Shared Slots: Two Lines instances share ONE Band transceiver
     Lines clientA;
     Lines clientB;
     clientA.manualUpgrade("client_shared_secret_32_bytes___", true, 2);
     clientB.manualUpgrade("client_shared_secret_32_bytes___", true, 2);
 
-    BandSlot *slotA = clientA.enable(pb);
-    BandSlot *slotB = clientB.enable(pb);
+    LinesBandSlot *slotA = clientA.enable(pb);
+    LinesBandSlot *slotB = clientB.enable(pb);
     assert(pb.slots.size() == 2);
-    assert(slotA->physical == &pb);
-    assert(slotB->physical == &pb);
+    assert(slotA->band == &pb);
+    assert(slotB->band == &pb);
 
     // 3. Stun propagates across slots sharing the physical medium
     pb.stun(50);
@@ -429,9 +461,9 @@ static void test_physical_band_duty_and_shared_slots() {
     pb.sendCallback = [&](String b) { wireOut = b; };
 
     // Push into clientA
-    clientA.push(Packet(1, String("Shared band packet"), true, true));
+    clientA.push(Packet(String("Shared band packet"), 1, 1, true, true));
     assert(wireOut.size() > 0);
-    assert(server.parse(wireOut, 1));
+    assert(server.parse(wireOut));
 
     // 5. Slot removal and self-destruction check
     clientA.disable(slotA);
@@ -440,14 +472,14 @@ static void test_physical_band_duty_and_shared_slots() {
     assert(pb.slots.size() == 0);
 
     // Verify dynamically allocated band self-destructs safely on last slot removal
-    PhysicalBand *dynPb = new PhysicalBand();
+    Band *dynPb = new Band();
     dynPb->isDynamicallyAllocated = true;
     Lines clientC;
-    BandSlot *slotC = clientC.enable(dynPb);
+    LinesBandSlot *slotC = clientC.enable(dynPb);
     assert(dynPb->slots.size() == 1);
     clientC.disable(slotC); // Triggers removeSlot -> self-destructs dynPb safely!
 
-    printf("  -> PhysicalBand duty cycle, shared slots & self-destruction verified!\n");
+    printf("  -> Band duty cycle, shared slots & self-destruction verified!\n");
 }
 
 static void test_pre_upgrade_tuning_isolation() {
@@ -465,10 +497,10 @@ static void test_pre_upgrade_tuning_isolation() {
     assert(clientDefault.tune == "");
 
     String wireRedProbe;
-    clientRed.enable([&](String b) { wireRedProbe = b; }, 1);
-    serverRed.enable([](String) {}, 1);
-    clientBlue.enable([](String) {}, 1);
-    clientDefault.enable([](String) {}, 1);
+    clientRed.enable([&](String b) { wireRedProbe = b; });
+    serverRed.enable([](String) {});
+    clientBlue.enable([](String) {});
+    clientDefault.enable([](String) {});
 
     // Client Red broadcasts a Probe
     Tree sel;
@@ -478,25 +510,26 @@ static void test_pre_upgrade_tuning_isolation() {
     assert(!Lines::isEncrypted(wireRedProbe));
 
     // 1. Matching tune accepts instantly
-    assert(serverRed.parse(wireRedProbe, 1));
+    assert(serverRed.parse(wireRedProbe));
 
     // 2. Mismatched tune ("fleet_blue_915mhz") rejects on CRC mismatch at byte 2!
-    assert(!clientBlue.parse(wireRedProbe, 1));
+    assert(!clientBlue.parse(wireRedProbe));
 
     // 3. Default empty tune ("") also rejects because seed differs
-    assert(!clientDefault.parse(wireRedProbe, 1));
+    assert(!clientDefault.parse(wireRedProbe));
 
     // 4. Default empty tune communication works with other default nodes
     String wireDefaultProbe;
-    clientDefault.enable([&](String b) { wireDefaultProbe = b; }, 1);
+    clientDefault.enable([&](String b) { wireDefaultProbe = b; });
+    clientDefault.primingBandSlot = clientDefault.bands.size() - 1;
     clientDefault.probe(sel);
     assert(wireDefaultProbe.size() > 0);
 
     Lines serverDefault;
-    serverDefault.enable([](String) {}, 1);
-    assert(serverDefault.parse(wireDefaultProbe, 1)); // Default matches default!
-    assert(!clientRed.parse(wireDefaultProbe, 1));    // Red rejects default!
-    assert(!clientBlue.parse(wireDefaultProbe, 1));   // Blue rejects default!
+    serverDefault.enable([](String) {});
+    assert(serverDefault.parse(wireDefaultProbe)); // Default matches default!
+    assert(!clientRed.parse(wireDefaultProbe));    // Red rejects default!
+    assert(!clientBlue.parse(wireDefaultProbe));   // Blue rejects default!
 
     printf("  -> Multi-tenant medium tuning isolation verified with 0 extra wire bytes!\n");
 }
@@ -529,8 +562,8 @@ static void test_patches_routing_and_gateway() {
     Lines clientLines;
 
     // Cross-connect routerLines and clientLines with pre-upgrade tune = "Patches"
-    routerLines.enable([&](String b) { clientLines.recv(b, 1); }, 1);
-    clientLines.enable([&](String b) { routerLines.recv(b, 1); }, 1);
+    routerLines.enable([&](String b) { clientLines.recv(b); });
+    clientLines.enable([&](String b) { routerLines.recv(b); });
 
     PatchConnection *routerClientConn = router.addConnection(&routerLines, false, false);
     (void)routerClientConn;
@@ -552,8 +585,8 @@ static void test_patches_routing_and_gateway() {
     Tree meta;
     routerLines.onUpgrade(meta);
 
-    // Verify router sent Your Path (Action 1) on channel 1
-    // Client receives on channel 1, and since autoInferPath == true, client adopts the leased path!
+    // Verify router sent Your Path (Action 1) on handle 1
+    // Client receives on handle 1, and since autoInferPath == true, client adopts the leased path!
     assert(!clientNode.autoInferPath);
     assert(clientNode.path.toString() == "2.2.0");
 
@@ -577,8 +610,8 @@ static void test_patches_routing_and_gateway() {
     bool opened = clientNode.open(targetIp, 2, 32);
     assert(opened);
 
-    // Send payload on channel 2
-    clientLines.push(Packet("GET /index.html HTTP/1.1\r\n\r\n", 2, Packet::BestEffort));
+    // Send payload on handle 2
+    clientLines.push(Packet("GET /index.html HTTP/1.1\r\n\r\n", 2, 1, false));
 
     assert(overrideHit);
     assert(caughtPayload == "GET /index.html HTTP/1.1\r\n\r\n");
@@ -594,8 +627,8 @@ static void test_patches_routing_and_gateway() {
     // 7. Multi-Hop Cut-Through Switching (Sensor -> Router -> Gateway)
     Lines sensorLines;
     Lines clientRouterLines;
-    sensorLines.enable([&](String b) { clientRouterLines.recv(b, 1); }, 1);
-    clientRouterLines.enable([&](String b) { sensorLines.recv(b, 1); }, 1);
+    sensorLines.enable([&](String b) { clientRouterLines.recv(b); });
+    clientRouterLines.enable([&](String b) { sensorLines.recv(b); });
 
     sensorLines.manualUpgrade("PatchesSecretKey32BytesForTest!!", true, 2);
     clientRouterLines.manualUpgrade("PatchesSecretKey32BytesForTest!!", false, 2);
@@ -617,7 +650,7 @@ static void test_patches_routing_and_gateway() {
     assert(sensorOpened);
 
     // Sensor pushes data on Channel 2 - switches through clientNode directly to router
-    sensorLines.push(Packet("DATA_FROM_LORA_SENSOR", 2, Packet::BestEffort));
+    sensorLines.push(Packet("DATA_FROM_LORA_SENSOR", 2, 1, false));
     assert(overrideHit);
     assert(caughtPayload == "DATA_FROM_LORA_SENSOR");
 
@@ -627,6 +660,148 @@ static void test_patches_routing_and_gateway() {
     assert(router.circuits.size() == 0);
 
     printf("  -> Multi-hop cut-through switching, BGP Peering & Overrides verified!\n");
+}
+
+void test_packet_intent_demux() {
+    printf("[TEST 14] Packet Intent & Zero-Overhead Wire Framing...\n");
+
+    Lines client;
+    Lines server;
+
+    String testSecret = "32_byte_secret_key_testing_intent_";
+    client.manualUpgrade(testSecret, true, 2);
+    server.manualUpgrade(testSecret, false, 2);
+
+    String wire;
+    client.enable([&](String b) { wire = b; });
+
+    Packet receivedPkt;
+    bool gotPkt = false;
+    server.onPacket = [&](Packet p) {
+        receivedPkt = p;
+        gotPkt = true;
+    };
+
+    // 1. Default packet (handle 1, intent 1) -> 0 extra wire bytes
+    client.push(Packet(String("Default packet"), 1, 1, true));
+    assert(server.parse(wire));
+    assert(gotPkt);
+    assert(receivedPkt.payload == "Default packet");
+    assert(receivedPkt.handle == 1);
+    assert(receivedPkt.intent == 1);
+
+    // 2. Custom intent on Handle 1 (e.g. Intent::Ping = 2)
+    gotPkt = false;
+    Packet pingPkt(String("PING"), 1, 2, false);
+    client.push(pingPkt);
+    assert(server.parse(wire));
+    assert(gotPkt);
+    assert(receivedPkt.payload == "PING");
+    assert(receivedPkt.handle == 1);
+    assert(receivedPkt.intent == 2);
+
+    // 3. Custom handle & 64-bit varlong intent
+    gotPkt = false;
+    Packet rpcPkt(String("GET /user/42"), 7, 0x12345678ULL, true);
+    client.push(rpcPkt);
+    assert(server.parse(wire));
+    assert(gotPkt);
+    assert(receivedPkt.payload == "GET /user/42");
+    assert(receivedPkt.handle == 7);
+    assert(receivedPkt.intent == 0x12345678ULL);
+
+    // 4. Control Intent Disconnect: Handle 0 with IntentDisconnect (0)
+    bool disconnectedCaught = false;
+    server.onDisconnect = [&](Lines::Tree reason, bool initiator) {
+        disconnectedCaught = true;
+    };
+    client.disconnect();
+    assert(server.parse(wire));
+    assert(disconnectedCaught);
+
+    printf("  -> Packet intent demux, 64-bit varlong intent & control intents verified!\n");
+}
+
+static void test_instance_reset_pristine_lifecycle() {
+    printf("[TEST 15] Instance Reset (Pristine State Restoration & Seamless Reuse)...\n");
+
+    Lines client;
+    client.enable([](String) {});
+    client.manualUpgrade("32_byte_secret_reset_test_______", true, 2);
+
+    assert(client.isUpgraded());
+    assert(client.bands.size() == 1);
+
+    // Push 40 packets across multiple handles to heavily mutate state
+    for (int i = 0; i < 40; ++i) {
+        client.push(Packet(String("Heavy duty payload #") + String(i), i % 5 + 1, 1, true, true));
+    }
+    assert(client.nonce > 2);
+    assert(client.outbox.size() > 0);
+    assert(client.getPressure() > 0.0f);
+
+    // Reset the instance
+    client.reset();
+
+    // Verify instance is pristine brand new
+    assert(!client.isUpgraded());
+    assert(client.upgradeTime == 0);
+    assert(client.nonce == 2);
+    assert(client.base == 2);
+    assert(client.sendBase == 2);
+    assert(client.windowBitmap == 0);
+    assert(client.outbox.size() == 0);
+    assert(client.inbox.size() == 0);
+    assert(client.toBeBundled.size() == 0);
+    assert(client.handleSequences.size() == 0);
+    assert(client.bands.size() == 0);
+    assert(client.sharedKey.size() == 0);
+    assert(client.ourDirectionalKey == u256());
+    assert(client.theirDirectionalKey == u256());
+    assert(!client.initiator);
+    assert(client.getPressure() == 0.0f);
+    assert(client.couldPush());
+
+    // Reuse the exact same instance for a fresh session
+    String clientWire;
+    String serverWire;
+    client.enable([&](String b) { clientWire = b; });
+
+    Lines server;
+    server.enable([&](String b) { serverWire = b; });
+
+    // Fresh 1.5-RTT Handshake
+    server.onProbe = [&](Lines::Tree) -> bool { return true; };
+    client.onAnnounce = [&]() -> bool { return true; };
+
+    client.probe();
+    assert(clientWire.size() > 0);
+    assert(server.parse(clientWire));
+    assert(serverWire.size() > 0);
+
+    assert(client.parse(serverWire));
+    assert(client.isUpgraded());
+
+    assert(server.parse(clientWire));
+    assert(server.isUpgraded());
+
+    // Transmit data on reused instance
+    String receivedPayload;
+    server.onPacket = [&](Packet p) {
+        receivedPayload = p.payload;
+    };
+
+    client.push(Packet(String("Brand new message on reused instance"), 3, 1, true, true));
+    assert(server.parse(clientWire));
+    assert(receivedPayload == "Brand new message on reused instance");
+
+    // Disconnect automatically calls reset()
+    client.disconnect();
+    assert(!client.isUpgraded());
+    assert(client.outbox.size() == 0);
+    assert(client.bands.size() == 0);
+
+    printf("  -> Lines instance after reset is verified 100%% pristine and reusable!\n");
 }
 
 int main() {
@@ -647,9 +822,11 @@ int main() {
     test_physical_band_duty_and_shared_slots();
     test_pre_upgrade_tuning_isolation();
     test_patches_routing_and_gateway();
+    test_packet_intent_demux();
+    test_instance_reset_pristine_lifecycle();
 
     printf("====================================================\n");
-    printf("     ALL 13 TEST SUITES PASSED CLEANLY (100%%)!     \n");
+    printf("     ALL 15 TEST SUITES PASSED CLEANLY (100%%)!     \n");
     printf("====================================================\n");
     return 0;
 }

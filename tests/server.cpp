@@ -12,8 +12,8 @@
 
 using namespace Ksee;
 using Lines = Ksee::Lines;
-using PhysicalBand = Ksee::PhysicalBand;
-using BandSlot = Ksee::BandSlot;
+using Band = Ksee::Band;
+using LinesBandSlot = Ksee::LinesBandSlot;
 using Packet = Ksee::Packet;
 using SentBundle = Ksee::SentBundle;
 using RecvBundle = Ksee::RecvBundle;
@@ -71,11 +71,14 @@ int main(int argc, char **argv) {
     printf("[Lines Server] Listening on 127.0.0.1:%d (Expecting %d MB of data)\n", port, totalMB);
 
     ClientSession session;
-    session.lines.enable([&](String bundle) {
+    Band pb;
+    pb.sendCallback = [&](String bundle) {
         if (session.active) {
             sendto(sockfd, bundle.data(), bundle.size(), 0, (sockaddr*)&session.addr, sizeof(session.addr));
         }
-    }, /* band = */ 1, /* initialWeight = */ 100, /* maxBundleSize = */ 36000);
+    };
+    pb.maxBundleSize = 36000;
+    session.lines.enable(pb);
 
     session.lines.onProbe = [&](Lines::Tree selector) -> bool {
         String json = stringifyJSON(selector, 2);
@@ -95,7 +98,7 @@ int main(int argc, char **argv) {
     bool hashVerified = false;
 
     session.lines.onPacket = [&](Packet packet) {
-        if (packet.channel == 1) {
+        if (packet.handle == 1) {
             if (packet.payload.size() == 69 && packet.payload.startsWith("HASH:")) {
                 String clientHashHex = packet.payload.substring(5);
                 printf("[Lines Server] Received Client SHA256 Hash: %s\n", clientHashHex.c_str());
@@ -108,15 +111,15 @@ int main(int argc, char **argv) {
                     if (serverHashHex == clientHashHex) {
                         hashVerified = true;
                         printf("[Lines Server] SUCCESS: 50MB HASH MATCH CONFIRMED!\n");
-                        session.lines.push(Packet(1, "HASH_OK", true, true));
+                        session.lines.push(Packet("HASH_OK", 1, 1, true, true));
                     } else {
                         printf("[Lines Server] ERROR: HASH MISMATCH!\n");
-                        session.lines.push(Packet(1, "HASH_ERR", true, true));
+                        session.lines.push(Packet("HASH_ERR", 1, 1, true, true));
                     }
                 } else {
                     printf("[Lines Server] ERROR: Incomplete transfer (%zu / %zu bytes)\n",
                            serverBytesReceived, totalBytes);
-                    session.lines.push(Packet(1, "HASH_INCOMPLETE", true, true));
+                    session.lines.push(Packet("HASH_INCOMPLETE", 1, 1, true, true));
                 }
             } else {
                 if (serverBytesReceived + packet.payload.size() <= totalBytes) {
@@ -158,16 +161,16 @@ int main(int argc, char **argv) {
                 session.active = true;
 
                 String bundle((const u8*)buffer, (usz)n);
-                session.lines.parse(bundle, 1);
+                session.lines.parse(bundle);
 
                 if (++sackCounter >= 8) {
-                    session.lines.sendSackHeartbeat(1);
+                    session.lines.sendSackHeartbeat();
                     sackCounter = 0;
                     lastServerSack = millis();
                 }
             }
             if (sackCounter > 0) {
-                session.lines.sendSackHeartbeat(1);
+                session.lines.sendSackHeartbeat();
                 sackCounter = 0;
                 lastServerSack = millis();
             }

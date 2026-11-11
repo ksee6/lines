@@ -13,6 +13,8 @@
 
 namespace Ksee {
 
+using Ksee::crypt;
+
 // ---------------------------------------------------------------------------
 // Low-Level Protocol Primitives & VarInt
 // ---------------------------------------------------------------------------
@@ -104,122 +106,20 @@ static inline u16 computeDeltaMask(const u256 &directionalKey, const u8 *ciphert
 }
 
 // ---------------------------------------------------------------------------
-// BandSlot Implementation
+// LinesBandSlot Implementation
 // ---------------------------------------------------------------------------
 
-bool BandSlot::isAvailable() const {
-    if (!physical) return false;
-    return physical->couldPush();
-}
-
-// ---------------------------------------------------------------------------
-// PhysicalBand Implementation
-// ---------------------------------------------------------------------------
-
-PhysicalBand::PhysicalBand() {
-    lastDebtRegenTime = millis();
-}
-
-PhysicalBand::~PhysicalBand() {
-    for (usz i = 0; i < slots.size(); ++i) {
-        if (slots[i] && slots[i]->physical == this) {
-            slots[i]->physical = nullptr;
-        }
+LinesBandSlot::~LinesBandSlot() {
+    if (band) {
+        Band *b = band;
+        band = nullptr;
+        b->removeSlot(this);
     }
 }
 
-bool PhysicalBand::couldPush() const {
-    u64 now = millis();
-    if (now < stunnedUntil) return false;
-    if (maxDuty > 0 && duty >= maxDuty) return false;
-    return true;
-}
-
-void PhysicalBand::stun(u64 duration) {
-    if (duration == 0) {
-        duration = 1 + (randomNumber<u32>() % 5);
-    }
-    stunnedUntil = millis() + duration;
-}
-
-void PhysicalBand::push(const String &bundle) {
-    if (!couldPush()) return;
-    if (maxBundleSize > 0 && bundle.size() > maxBundleSize) return;
-
-    u64 a = millis();
-    if (sendCallback) {
-        sendCallback(bundle);
-    }
-    u64 b = millis();
-    u64 airtime = (b >= a) ? (b - a) : 0;
-    duty += (airtime > 0 ? airtime : 1);
-}
-
-void PhysicalBand::recv(const String &bundle) {
-    if (maxBundleSize > 0 && bundle.size() > maxBundleSize) return;
-    for (usz i = 0; i < slots.size(); ++i) {
-        if (slots[i] && slots[i]->lines) {
-            if (slots[i]->lines->parse(bundle, slots[i])) {
-                break;
-            }
-        }
-    }
-}
-
-void PhysicalBand::addSlot(BandSlot *slot) {
-    if (!slot) return;
-    for (usz i = 0; i < slots.size(); ++i) {
-        if (slots[i] == slot) return;
-    }
-    slots.push(slot);
-    slot->physical = this;
-}
-
-void PhysicalBand::removeSlot(BandSlot *slot) {
-    for (usz i = 0; i < slots.size(); ++i) {
-        if (slots[i] == slot) {
-            slots.remove(i);
-            break;
-        }
-    }
-    if (slot && slot->physical == this) {
-        slot->physical = nullptr;
-    }
-    // "if this is the last slot, it self destructs."
-    if (slots.isEmpty() && isDynamicallyAllocated) {
-        delete this;
-    }
-}
-
-void PhysicalBand::update(bool doLinesUpdates) {
-    u64 now = millis();
-    if (lastDebtRegenTime == 0) lastDebtRegenTime = now;
-    if (now >= lastDebtRegenTime + 1000) {
-        u64 elapsedSec = (now - lastDebtRegenTime) / 1000;
-        lastDebtRegenTime += elapsedSec * 1000;
-        if (maxDuty > 0) {
-            u64 deduct = maxDuty * elapsedSec;
-            if (duty > deduct) duty -= deduct;
-            else duty = 0;
-        } else {
-            duty = 0;
-        }
-    }
-
-    if (recvCallback) {
-        String data = recvCallback();
-        if (data.size() > 0) {
-            recv(data);
-        }
-    }
-
-    if (doLinesUpdates) {
-        for (usz i = 0; i < slots.size(); ++i) {
-            if (slots[i] && slots[i]->lines) {
-                slots[i]->lines->update(/* callPBUpdates = */ false);
-            }
-        }
-    }
+bool LinesBandSlot::isAvailable() const {
+    if (!band) return false;
+    return band->couldPush();
 }
 
 // ---------------------------------------------------------------------------
@@ -227,44 +127,48 @@ void PhysicalBand::update(bool doLinesUpdates) {
 // ---------------------------------------------------------------------------
 
 Lines::Lines() {
-    epheKeypair = XKeypair::generate();
-    lastSeen = millis();
-    lastSent = millis();
-    baseMoveTime = millis();
-    base = 2;
-    sendBase = 2;
-    nonce = 2;
-    windowBitmap = 0;
+    reset();
 }
 
 Lines::~Lines() {
-    destroy();
+    reset();
 }
 
-void Lines::destroy() {
-    if (onDestroy) {
-        onDestroy();
-        onDestroy = nullptr;
-    }
+void Lines::reset() {
     outbox.clear();
     inbox.clear();
-    retransmissionBuffer.clear();
     toBeBundled.clear();
-    channelSequences.clear();
+    handleSequences.clear();
+
+    // Zero / clear cryptographic identities & session keys
     sharedKey.clear();
-    epheKeypair = XKeypair();
-    windowBitmap = 0;
+    ourDirectionalKey = u256();
+    theirDirectionalKey = u256();
+    epheKeypair = XKeypair::generate();
+    theirEphePublic = u256();
+    theirMetadata.clear();
+    theirStaticPublics.clear();
+    theirStatics.clear();
+    initiator = false;
+
+    // Reset window registers, timing & heartbeat state
+    upgradeTime = 0;
     base = 2;
     sendBase = 2;
     nonce = 2;
+    windowBitmap = 0;
+    baseMoveTime = millis();
+    retransmitFrom = 0;
+    lastSeen = millis();
+    lastSent = millis();
+    primingBandSlot = 0;
+    nextBestEffortHeartbeat = 0;
+    nextCuriosityHeartbeat = 0;
 
-    // Clean up band slots
+    // Clean up heap-allocated band slots
     for (usz i = 0; i < bands.size(); ++i) {
-        BandSlot *slot = bands[i];
+        LinesBandSlot *slot = bands[i];
         if (slot) {
-            if (slot->physical) {
-                slot->physical->removeSlot(slot);
-            }
             delete slot;
         }
     }
@@ -306,57 +210,53 @@ void Lines::manualUpgrade(const String &key, bool isInitiator, u64 initialNonce)
 // Multi-Band Management
 // ---------------------------------------------------------------------------
 
-BandSlot* Lines::enable(Func<void(String)> sendCallback, Func<String()> recvCallback) {
-    PhysicalBand *pb = new PhysicalBand();
-    pb->isDynamicallyAllocated = true;
-    pb->sendCallback = sendCallback;
-    pb->recvCallback = recvCallback;
-    return enable(pb);
+LinesBandSlot* Lines::enable(Func<void(String)> sendCallback, Func<String()> recvCallback) {
+    Band *b = new Band();
+    b->isDynamicallyAllocated = true;
+    b->sendCallback = sendCallback;
+    b->recvCallback = recvCallback;
+    return enable(b);
 }
 
-BandSlot* Lines::enable(PhysicalBand &physicalBand) {
-    BandSlot *slot = new BandSlot();
+LinesBandSlot* Lines::enable(Band &band) {
+    LinesBandSlot *slot = new LinesBandSlot();
     slot->lines = this;
     slot->id = bands.size() + 1;
     slot->windowResetTime = millis();
-    physicalBand.addSlot(slot);
+    slot->band = &band;
+    band.onSlotDetached = [](void *s) {
+        if (s) {
+            LinesBandSlot *sl = (LinesBandSlot*)s;
+            sl->band = nullptr;
+        }
+    };
+    band.addSlot(slot);
     bands.push(slot);
     return slot;
 }
 
-BandSlot* Lines::enable(PhysicalBand *physicalBand) {
-    if (!physicalBand) return nullptr;
-    return enable(*physicalBand);
+LinesBandSlot* Lines::enable(Band *band) {
+    if (!band) return nullptr;
+    return enable(*band);
 }
 
-BandSlot* Lines::enable(BandSlot *bandSlot) {
+LinesBandSlot* Lines::enable(LinesBandSlot *bandSlot) {
     if (!bandSlot) return nullptr;
     bandSlot->lines = this;
     bands.push(bandSlot);
-    if (bandSlot->physical) {
-        bandSlot->physical->addSlot(bandSlot);
+    if (bandSlot->band) {
+        bandSlot->band->addSlot(bandSlot);
     }
     return bandSlot;
 }
 
-BandSlot* Lines::enable() {
-    PhysicalBand *pb = new PhysicalBand();
-    pb->isDynamicallyAllocated = true;
-    return enable(pb);
+LinesBandSlot* Lines::enable() {
+    Band *b = new Band();
+    b->isDynamicallyAllocated = true;
+    return enable(b);
 }
 
-BandSlot* Lines::enable(Func<void(String)> sendCallback, u64 legacyBandId, u64 initialWeight, u64 maxBundleSize) {
-    PhysicalBand *pb = new PhysicalBand();
-    pb->isDynamicallyAllocated = true;
-    pb->sendCallback = sendCallback;
-    pb->idealCapacity = initialWeight;
-    pb->maxBundleSize = (maxBundleSize < 255 && maxBundleSize > 0) ? 255 : maxBundleSize;
-    BandSlot *slot = enable(pb);
-    if (slot) slot->id = legacyBandId;
-    return slot;
-}
-
-void Lines::disable(BandSlot *slot) {
+void Lines::disable(LinesBandSlot *slot) {
     if (!slot) return;
     for (usz i = 0; i < bands.size(); ++i) {
         if (bands[i] == slot) {
@@ -364,19 +264,14 @@ void Lines::disable(BandSlot *slot) {
             break;
         }
     }
-    if (slot->physical) {
-        slot->physical->removeSlot(slot);
-    }
     delete slot;
 }
 
 void Lines::disable(u64 bandSlotIdx) {
-    // If index matches directly in bands
     if (bandSlotIdx < bands.size()) {
         disable(bands[bandSlotIdx]);
         return;
     }
-    // Check legacy slot id
     for (usz i = 0; i < bands.size(); ++i) {
         if (bands[i] && bands[i]->id == bandSlotIdx) {
             disable(bands[i]);
@@ -385,9 +280,9 @@ void Lines::disable(u64 bandSlotIdx) {
     }
 }
 
-void Lines::stun(BandSlot *slot, u64 duration) {
-    if (slot && slot->physical) {
-        slot->physical->stun(duration);
+void Lines::stun(LinesBandSlot *slot, u64 duration) {
+    if (slot && slot->band) {
+        slot->band->stun(duration);
     }
 }
 
@@ -402,15 +297,6 @@ void Lines::stun(u64 bandSlotIdx, u64 duration) {
             return;
         }
     }
-}
-
-u64 Lines::getBandWeight(u64 band) const {
-    for (usz i = 0; i < bands.size(); ++i) {
-        if (bands[i] && bands[i]->id == band) {
-            return bands[i]->getSendThroughput();
-        }
-    }
-    return 0;
 }
 
 u64 Lines::getSendThroughput() const {
@@ -447,7 +333,7 @@ u64 Lines::getLatency() const {
 f32 Lines::getPressure() const {
     u32 unacked = 0;
     for (const auto &pair : outbox) {
-        if (pair.value.ackTime == 0 && pair.value.delivery == Packet::Reliable) unacked++;
+        if (pair.value.ackTime == 0 && pair.value.reliable) unacked++;
     }
     return (f32)unacked / (f32)size;
 }
@@ -461,14 +347,14 @@ bool Lines::couldPush() const {
 // Band Selection & Scheduling
 // ---------------------------------------------------------------------------
 
-i64 Lines::getBestReliableBand() const {
+i64 Lines::getBestBand() const {
     i64 bestIdx = -1;
     u64 maxCap = 0;
 
     for (usz i = 0; i < bands.size(); ++i) {
-        BandSlot *s = bands[i];
+        LinesBandSlot *s = bands[i];
         if (!s || !s->isAvailable()) continue;
-        u64 cap = s->getSendCapacity();
+        u64 cap = s->getCapacity();
         if (cap > maxCap) {
             maxCap = cap;
             bestIdx = (i64)i;
@@ -487,55 +373,36 @@ i64 Lines::getBestReliableBand() const {
     return bestIdx;
 }
 
-i64 Lines::getBestEffortBand() const {
-    i64 bestIdx = -1;
-    u64 minLat = (u64)-1;
-
-    for (usz i = 0; i < bands.size(); ++i) {
-        BandSlot *s = bands[i];
-        if (!s || !s->isAvailable()) continue;
-        u64 lat = s->getLatency();
-        if (lat < minLat) {
-            minLat = lat;
-            bestIdx = (i64)i;
-        }
-    }
-
-    if (bestIdx == -1) return getBestReliableBand();
-    return bestIdx;
-}
-
-i64 Lines::getBestCuriosityBand() const {
+i64 Lines::selectUnexploredBand(u32 jitter) const {
     Array<i64> candidateIndices;
-    Array<i64> headroomScores;
+    Array<u64> potentialScores;
 
     for (usz i = 0; i < bands.size(); ++i) {
-        BandSlot *s = bands[i];
+        LinesBandSlot *s = bands[i];
         if (!s || !s->isAvailable()) continue;
         candidateIndices.push((i64)i);
-        u64 ideal = s->physical ? s->physical->idealCapacity : 0;
-        i64 headroom = (i64)ideal - (i64)s->getSendCapacity();
-        headroomScores.push(headroom);
+        potentialScores.push(s->getPotential());
     }
 
     if (candidateIndices.size() == 0) return -1;
     if (candidateIndices.size() == 1) return candidateIndices[0];
 
-    // Bubble-sort ranks by headroom descending
+    // Sort ranks by potential descending
     for (usz i = 0; i < candidateIndices.size(); ++i) {
         for (usz j = i + 1; j < candidateIndices.size(); ++j) {
-            if (headroomScores[j] > headroomScores[i]) {
-                std::swap(headroomScores[i], headroomScores[j]);
+            if (potentialScores[j] > potentialScores[i]) {
+                std::swap(potentialScores[i], potentialScores[j]);
                 std::swap(candidateIndices[i], candidateIndices[j]);
             }
         }
     }
 
-    // Stochastic rank perturbation (+/- 2 positions)
+    // Stochastic rank perturbation (+/- jitter positions)
     usz chosenIdx = 0;
-    if (candidateIndices.size() > 1) {
-        int jitter = (int)(randomNumber<u32>() % 5) - 2; // -2, -1, 0, 1, 2
-        int target = (int)chosenIdx + jitter;
+    if (jitter > 0 && candidateIndices.size() > 1) {
+        u32 range = 2 * jitter + 1;
+        int delta = (int)(randomNumber<u32>() % range) - (int)jitter;
+        int target = (int)chosenIdx + delta;
         if (target < 0) target = 0;
         if (target >= (int)candidateIndices.size()) target = (int)candidateIndices.size() - 1;
         chosenIdx = (usz)target;
@@ -564,12 +431,12 @@ void Lines::scheduleNextCuriosityHeartbeat() {
     nextCuriosityHeartbeat = millis() + interval;
 }
 
-void Lines::sendSackHeartbeat(BandSlot *targetSlot) {
-    sendSack(Packet::BestEffort, targetSlot);
+void Lines::sendSackHeartbeat(LinesBandSlot *targetSlot) {
+    sendSack(false, targetSlot);
 }
 
 void Lines::sendSackHeartbeat(u64 targetBandSlotIdx) {
-    BandSlot *slot = (targetBandSlotIdx < bands.size()) ? bands[targetBandSlotIdx] : nullptr;
+    LinesBandSlot *slot = (targetBandSlotIdx < bands.size()) ? bands[targetBandSlotIdx] : nullptr;
     sendSackHeartbeat(slot);
 }
 
@@ -593,7 +460,7 @@ void Lines::probe(const Tree &sel) {
 
     // Single-packet Pre-Upgrade Bundle:
     // Header (2B): isEncrypted = 0 (bit 15), CRC-15-CAN (bits 14..0)
-    // PacketHeader (1B): channelOtherThanOne = 0 (channel 0 is handshake)
+    // PacketHeader (1B): hasHandle = 0, respectsOrder = 0, isTheFinalPacketInThisBundle = 0, hasIntent = 0
     String bundle;
     bundle.allocate(3 + payload.size());
     bundle[0] = 0;
@@ -608,12 +475,12 @@ void Lines::probe(const Tree &sel) {
     bundle[0] = (char)(u8)(crc & 0xFF);
     bundle[1] = (char)(u8)((crc >> 8) & 0x7F); // Bit 15 is 0
 
-    i64 targetBandIdx = getBestReliableBand();
-    BandSlot *slot = (targetBandIdx >= 0 && (usz)targetBandIdx < bands.size()) ? bands[(usz)targetBandIdx] : nullptr;
+    i64 targetBandIdx = getBestBand();
+    LinesBandSlot *slot = (targetBandIdx >= 0 && (usz)targetBandIdx < bands.size()) ? bands[(usz)targetBandIdx] : nullptr;
     if (!slot && bands.size() > 0) slot = bands[0];
 
-    if (slot && slot->physical) {
-        slot->physical->push(bundle);
+    if (slot && slot->band) {
+        slot->band->push(bundle);
         lastSent = millis();
     }
 }
@@ -665,12 +532,12 @@ void Lines::upgrade(const Tree &clientMetadata) {
     bundle[0] = (char)(u8)(crc & 0xFF);
     bundle[1] = (char)(u8)((crc >> 8) & 0x7F);
 
-    i64 targetBandIdx = getBestReliableBand();
-    BandSlot *slot = (targetBandIdx >= 0 && (usz)targetBandIdx < bands.size()) ? bands[(usz)targetBandIdx] : nullptr;
+    i64 targetBandIdx = getBestBand();
+    LinesBandSlot *slot = (targetBandIdx >= 0 && (usz)targetBandIdx < bands.size()) ? bands[(usz)targetBandIdx] : nullptr;
     if (!slot && bands.size() > 0) slot = bands[0];
 
-    if (slot && slot->physical) {
-        slot->physical->push(bundle);
+    if (slot && slot->band) {
+        slot->band->push(bundle);
         lastSent = millis();
     }
 
@@ -682,23 +549,19 @@ void Lines::upgrade(const Tree &clientMetadata) {
     scheduleNextCuriosityHeartbeat();
 
     if (onUpgrade) onUpgrade(theirMetadata);
-    if (onReady) onReady();
 }
 
 void Lines::disconnect(const Tree &reason) {
     if (!isUpgraded()) return;
-    String payload;
-    encodeVarInt(0, payload); // Action 0: Disconnect
     String reasonBytes = petrify(reason);
-    payload.append(reasonBytes.data(), reasonBytes.size());
 
-    Packet p(payload, 0, Packet::Reliable, false);
+    Packet p(reasonBytes, 0, IntentDisconnect, true, true, false);
     Array<Packet> pkts;
     pkts.push(p);
-    sendPostUpgradeBundle(pkts, Packet::Reliable);
+    sendPostUpgradeBundle(pkts, true, false);
 
     if (onDisconnect) onDisconnect(reason, true);
-    destroy();
+    reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -715,44 +578,42 @@ void Lines::push(const Packet &packet) {
 void Lines::flushBundles() {
     if (!isUpgraded() || toBeBundled.isEmpty()) return;
 
-    Array<Packet> reliablePkts;
-    Array<Packet> bestEffortPkts;
-    Array<Packet> curiosityPkts;
+    Array<Packet> standardReliable;
+    Array<Packet> standardUnreliable;
+    Array<Packet> sacrificialPkts;
 
     for (usz i = 0; i < toBeBundled.size(); ++i) {
-        if (toBeBundled[i].delivery == Packet::Reliable) {
-            reliablePkts.push(toBeBundled[i]);
-        } else if (toBeBundled[i].delivery == Packet::BestEffort) {
-            bestEffortPkts.push(toBeBundled[i]);
+        if (toBeBundled[i].sacrificial) {
+            sacrificialPkts.push(toBeBundled[i]);
+        } else if (toBeBundled[i].reliable) {
+            standardReliable.push(toBeBundled[i]);
         } else {
-            curiosityPkts.push(toBeBundled[i]);
+            standardUnreliable.push(toBeBundled[i]);
         }
     }
     toBeBundled.clear();
 
-    if (!reliablePkts.isEmpty()) {
-        sendPostUpgradeBundle(reliablePkts, Packet::Reliable);
+    if (!standardReliable.isEmpty()) {
+        sendPostUpgradeBundle(standardReliable, true, false);
     }
-    if (!bestEffortPkts.isEmpty()) {
-        sendPostUpgradeBundle(bestEffortPkts, Packet::BestEffort);
+    if (!standardUnreliable.isEmpty()) {
+        sendPostUpgradeBundle(standardUnreliable, false, false);
     }
-    if (!curiosityPkts.isEmpty()) {
-        sendPostUpgradeBundle(curiosityPkts, Packet::Curiosity);
+    if (!sacrificialPkts.isEmpty()) {
+        sendPostUpgradeBundle(sacrificialPkts, false, true);
     }
 }
 
-void Lines::sendPostUpgradeBundle(const Array<Packet> &packets, Packet::Delivery delivery, BandSlot *preferredSlot) {
+void Lines::sendPostUpgradeBundle(const Array<Packet> &packets, bool reliable, bool sacrificial, LinesBandSlot *preferredSlot) {
     if (packets.size() == 0) return;
 
-    BandSlot *targetSlot = preferredSlot;
+    LinesBandSlot *targetSlot = preferredSlot;
     if (targetSlot == nullptr) {
         i64 idx = -1;
-        if (delivery == Packet::Reliable) {
-            idx = getBestReliableBand();
-        } else if (delivery == Packet::BestEffort) {
-            idx = getBestEffortBand();
+        if (sacrificial) {
+            idx = selectUnexploredBand(2);
         } else {
-            idx = getBestCuriosityBand();
+            idx = getBestBand();
         }
         if (idx >= 0 && (usz)idx < bands.size()) {
             targetSlot = bands[(usz)idx];
@@ -777,13 +638,25 @@ void Lines::sendPostUpgradeBundle(const Array<Packet> &packets, Packet::Delivery
 
         String pktData;
         u8 headerByte = 0;
-        if (p.channel != 1) headerByte |= 0x01; // channelOtherThanOne
-        if (p.respectsOrder) headerByte |= 0x02; // respectsOrder
-        if (finalPacket) headerByte |= 0x04;    // isTheFinalPacketInThisBundle
+        if (p.handle != 1)         headerByte |= 0x01; // hasHandle
+        if (p.intent != 1)         headerByte |= 0x02; // hasIntent
+        if (p.offset != 0)         headerByte |= 0x04; // hasOffset
+        if (p.intendedLength != 0) headerByte |= 0x08; // hasIntendedLength
+        if (finalPacket)           headerByte |= 0x10; // isTheFinalPacketInThisBundle
+        if (p.ordered)             headerByte |= 0x20; // ordered
 
         pktData.push((char)headerByte);
-        if (p.channel != 1) {
-            encodeVarInt(p.channel, pktData);
+        if (p.handle != 1) {
+            encodeVarInt(p.handle, pktData);
+        }
+        if (p.intent != 1) {
+            encodeVarInt(p.intent, pktData);
+        }
+        if (p.offset != 0) {
+            encodeVarInt(p.offset, pktData);
+        }
+        if (p.intendedLength != 0) {
+            encodeVarInt(p.intendedLength, pktData);
         }
         pktData.append(p.payload.data(), p.payload.size());
 
@@ -821,13 +694,13 @@ void Lines::sendPostUpgradeBundle(const Array<Packet> &packets, Packet::Delivery
         memcpy(wire.data() + 10, ciphertext.data(), ciphertext.size());
     }
 
-    transmitBundle(bundleId, wire, targetSlot, delivery);
+    transmitBundle(bundleId, wire, targetSlot, reliable, sacrificial);
 }
 
-void Lines::transmitBundle(u64 bundleId, const String &rawBundle, BandSlot *slot, Packet::Delivery delivery) {
-    if (!slot || !slot->physical) return;
+void Lines::transmitBundle(u64 bundleId, const String &rawBundle, LinesBandSlot *slot, bool reliable, bool sacrificial) {
+    if (!slot || !slot->band) return;
 
-    slot->physical->push(rawBundle);
+    slot->band->push(rawBundle);
     lastSent = millis();
 
     // Outbox Accounting
@@ -836,19 +709,18 @@ void Lines::transmitBundle(u64 bundleId, const String &rawBundle, BandSlot *slot
     sb.ackTime = 0;
     sb.size = rawBundle.size();
     sb.bandSlot = slot;
-    sb.band = slot->id;
-    sb.delivery = delivery;
+    sb.reliable = reliable;
+    sb.sacrificial = sacrificial;
 
-    u64 estSpeed = slot->getSendCapacity();
+    u64 estSpeed = slot->getCapacity();
     sb.duty = (estSpeed > 0) ? ((sb.size * 1000) / estSpeed) : 1;
     if (sb.duty == 0) sb.duty = 1;
 
-    if (delivery == Packet::Reliable) {
+    if (reliable) {
         sb.bundle = rawBundle;
-        retransmissionBuffer[bundleId] = rawBundle;
     } else {
-        sb.bundle.clear(); // BestEffort and Curiosity are never stored
-        sb.ackTime = millis(); // BestEffort is fire-and-forget, immediately acked
+        sb.bundle.clear();
+        sb.ackTime = millis();
     }
 
     outbox[bundleId] = sb;
@@ -862,8 +734,7 @@ void Lines::transmitBundle(u64 bundleId, const String &rawBundle, BandSlot *slot
 void Lines::advanceSendBase() {
     while (sendBase < nonce) {
         const SentBundle *sb = outbox.get(sendBase);
-        if (sb == nullptr || sb->delivery != Packet::Reliable || sb->ackTime != 0) {
-            if (retransmissionBuffer.has(sendBase)) retransmissionBuffer.remove(sendBase);
+        if (sb == nullptr || !sb->reliable || sb->ackTime != 0) {
             sendBase++;
         } else {
             break;
@@ -892,9 +763,8 @@ void Lines::setAcknowledged(u64 fromDelta, u64 toDelta, u64 ackTime) {
             SentBundle &sb = outbox[bundleId];
             sb.ackTime = now;
             sb.bundle.clear(); // Free payload memory on ACK
-            if (retransmissionBuffer.has(bundleId)) retransmissionBuffer.remove(bundleId);
             if (sb.bandSlot) {
-                BandSlot *s = sb.bandSlot;
+                LinesBandSlot *s = sb.bandSlot;
                 s->ackedBytesLastSec += sb.size;
                 u64 rtt = (now > sb.sentTime) ? (now - sb.sentTime) : 1;
                 u64 lat = rtt / 2;
@@ -919,10 +789,10 @@ void Lines::advanceWindow(u64 currentBase) {
         baseMoveTime = millis();
 
         // Deliver queued packets whose bundleId is now <= base
-        for (auto &pair : channelSequences) {
-            ChannelSeq &cs = pair.value;
+        for (auto &pair : handleSequences) {
+            HandleSeq &hs = pair.value;
             Array<u64> readyIds;
-            for (const auto &holPair : cs.holQueue) {
+            for (const auto &holPair : hs.holQueue) {
                 if (holPair.key <= base) readyIds.push(holPair.key);
             }
             for (usz i = 0; i < readyIds.size(); ++i) {
@@ -933,8 +803,8 @@ void Lines::advanceWindow(u64 currentBase) {
                         readyIds[j] = tmp;
                     }
                 }
-                Packet p = cs.holQueue[readyIds[i]];
-                cs.holQueue.remove(readyIds[i]);
+                Packet p = hs.holQueue[readyIds[i]];
+                hs.holQueue.remove(readyIds[i]);
                 if (onPacket) onPacket(p);
             }
         }
@@ -986,8 +856,8 @@ Array<Interval<u64>> Lines::showUnavailableToRetransmit() const {
         bool unavailable = false;
         const SentBundle *sb = outbox.get(bundleId);
         if (sb != nullptr) {
-            if (sb->delivery != Packet::Reliable || sb->ackTime != 0 || sb->bundle.size() == 0) {
-                unavailable = true; // Best-effort or cleared bundle
+            if (!sb->reliable || sb->ackTime != 0 || sb->bundle.size() == 0) {
+                unavailable = true;
             }
         }
         if (unavailable) {
@@ -1008,13 +878,12 @@ Array<Interval<u64>> Lines::showUnavailableToRetransmit() const {
     return intervals;
 }
 
-void Lines::sendSack(Packet::Delivery delivery, BandSlot *targetSlot) {
+void Lines::sendSack(bool sacrificial, LinesBandSlot *targetSlot) {
     if (!isUpgraded()) return;
     Array<Interval<u64>> received = showReceived();
     Array<Interval<u64>> unavailable = showUnavailableToRetransmit();
 
     String sackData;
-    encodeVarInt(1, sackData); // Action 1: SACK Heartbeat
     encodeVarInt(base, sackData); // Cumulative Base ACK
 
     u16 timeSinceBaseMove = (u16)((millis() - baseMoveTime) & 0xFFFF);
@@ -1033,12 +902,12 @@ void Lines::sendSack(Packet::Delivery delivery, BandSlot *targetSlot) {
         sackData.push((char)(u8)unavailable[i].right);
     }
 
-    Packet p(sackData, 0, delivery, false);
+    Packet p(sackData, 0, IntentSack, false, false, sacrificial);
     Array<Packet> pkts;
     pkts.push(p);
 
     if (targetSlot == nullptr) {
-        i64 idx = (delivery == Packet::BestEffort) ? getBestEffortBand() : getBestCuriosityBand();
+        i64 idx = sacrificial ? selectUnexploredBand(2) : getBestBand();
         if (idx >= 0 && (usz)idx < bands.size()) {
             targetSlot = bands[(usz)idx];
         }
@@ -1046,23 +915,25 @@ void Lines::sendSack(Packet::Delivery delivery, BandSlot *targetSlot) {
     if (targetSlot == nullptr && bands.size() > 0) targetSlot = bands[0];
     if (targetSlot == nullptr) return;
 
-    sendPostUpgradeBundle(pkts, delivery, targetSlot);
+    sendPostUpgradeBundle(pkts, false, sacrificial, targetSlot);
 }
 
 // ---------------------------------------------------------------------------
 // Wire Parsing & Inbound Processing
 // ---------------------------------------------------------------------------
 
-bool Lines::parse(const String &bundle, BandSlot *slot) {
+bool Lines::parse(const String &bundle, LinesBandSlot *slot) {
     if (bundle.size() < 3) return false;
+
+    if (!slot && bands.size() > 0) slot = bands[0];
 
     // Check throughput limits
     if (maxThroughput > 0 && getThroughput() >= maxThroughput) {
         return false;
     }
 
-    if (slot && slot->physical) {
-        if (slot->physical->maxBundleSize > 0 && bundle.size() > slot->physical->maxBundleSize) {
+    if (slot && slot->band) {
+        if (slot->band->maxBundleSize > 0 && bundle.size() > slot->band->maxBundleSize) {
             return false;
         }
         slot->bytesRecvLastSec += bundle.size();
@@ -1073,15 +944,31 @@ bool Lines::parse(const String &bundle, BandSlot *slot) {
         u16 receivedCrc = (u16)(u8)bundle[0] | ((u16)((u8)bundle[1] & 0x7F) << 8);
         u16 computedCrc = computeCrc15((const u8*)bundle.data() + 2, bundle.size() - 2, getTuneSeed());
         if (receivedCrc != computedCrc) {
-            if (slot && slot->physical) slot->physical->stun(0);
+            if (slot && slot->band) slot->band->stun(0);
             return false;
         }
 
         u8 packetHeader = (u8)bundle[2];
-        u64 channel = (packetHeader & 0x01) ? 0 : 1;
+        bool hasHandle = (packetHeader & 0x01) != 0;
+        bool hasIntent = (packetHeader & 0x02) != 0;
+        bool hasOffset = (packetHeader & 0x04) != 0;
+        bool hasIntendedLength = (packetHeader & 0x08) != 0;
         usz offset = 3;
-        if (packetHeader & 0x01) {
-            decodeVarInt((const u8*)bundle.data(), bundle.size(), offset, channel);
+        u64 handle = 1;
+        if (hasHandle) {
+            decodeVarInt((const u8*)bundle.data(), bundle.size(), offset, handle);
+        }
+        u64 intent = 1;
+        if (hasIntent) {
+            decodeVarInt((const u8*)bundle.data(), bundle.size(), offset, intent);
+        }
+        u64 off = 0;
+        if (hasOffset) {
+            decodeVarInt((const u8*)bundle.data(), bundle.size(), offset, off);
+        }
+        u64 intendedLen = 0;
+        if (hasIntendedLength) {
+            decodeVarInt((const u8*)bundle.data(), bundle.size(), offset, intendedLen);
         }
 
         String payload((const u8*)bundle.data() + offset, bundle.size() - offset);
@@ -1144,7 +1031,7 @@ bool Lines::parse(const String &bundle, BandSlot *slot) {
     // Verify 8-byte Poly1305 MAC
     const u8 *macInBundle = (const u8*)bundle.data() + 2;
     if (!verifyBundleMac(macInBundle, theirDirectionalKey, bundleId, ct, ctLen)) {
-        if (slot && slot->physical) slot->physical->stun(0);
+        if (slot && slot->band) slot->band->stun(0);
         return false;
     }
 
@@ -1158,7 +1045,6 @@ bool Lines::parse(const String &bundle, BandSlot *slot) {
     rb.recvTime = millis();
     rb.size = bundle.size();
     rb.bandSlot = slot;
-    rb.band = slot ? slot->id : 1;
     inbox[bundleId] = rb;
 
     lastSeen = millis();
@@ -1172,20 +1058,38 @@ bool Lines::parse(const String &bundle, BandSlot *slot) {
         if (pktLen == 0 || offset + pktLen > plaintext.size()) break;
 
         u8 pktHeader = (u8)plaintext[offset];
-        bool channelOther = (pktHeader & 0x01) != 0;
-        bool order = (pktHeader & 0x02) != 0;
-        bool finalPkt = (pktHeader & 0x04) != 0;
+        bool hasHandle = (pktHeader & 0x01) != 0;
+        bool hasIntent = (pktHeader & 0x02) != 0;
+        bool hasOffset = (pktHeader & 0x04) != 0;
+        bool hasIntendedLength = (pktHeader & 0x08) != 0;
+        bool finalPkt = (pktHeader & 0x10) != 0;
+        bool order = (pktHeader & 0x20) != 0;
 
         usz pktOffset = offset + 1;
-        u64 channel = 1;
-        if (channelOther) {
-            decodeVarInt((const u8*)plaintext.data(), offset + pktLen, pktOffset, channel);
+        u64 handle = 1;
+        if (hasHandle) {
+            decodeVarInt((const u8*)plaintext.data(), offset + pktLen, pktOffset, handle);
+        }
+
+        u64 intent = 1;
+        if (hasIntent) {
+            decodeVarInt((const u8*)plaintext.data(), offset + pktLen, pktOffset, intent);
+        }
+
+        u64 off = 0;
+        if (hasOffset) {
+            decodeVarInt((const u8*)plaintext.data(), offset + pktLen, pktOffset, off);
+        }
+
+        u64 intendedLen = 0;
+        if (hasIntendedLength) {
+            decodeVarInt((const u8*)plaintext.data(), offset + pktLen, pktOffset, intendedLen);
         }
 
         usz payloadLen = (offset + pktLen > pktOffset) ? (offset + pktLen - pktOffset) : 0;
         String pktPayload((const u8*)plaintext.data() + pktOffset, payloadLen);
 
-        Packet p(pktPayload, channel, Packet::Reliable, order);
+        Packet p(pktPayload, handle, intent, off, intendedLen, true, order, false);
         dispatchPacket(p, bundleId);
 
         offset += pktLen;
@@ -1195,50 +1099,32 @@ bool Lines::parse(const String &bundle, BandSlot *slot) {
     return true;
 }
 
-bool Lines::parse(const String &bundle, u64 legacyBandId) {
-    BandSlot *slot = nullptr;
-    if (legacyBandId > 0 && legacyBandId <= bands.size()) {
-        slot = bands[(usz)(legacyBandId - 1)];
-    } else {
-        for (usz i = 0; i < bands.size(); ++i) {
-            if (bands[i] && bands[i]->id == legacyBandId) {
-                slot = bands[i];
-                break;
-            }
-        }
-    }
-    if (!slot && bands.size() > 0) slot = bands[0];
-    return parse(bundle, slot);
-}
-
 void Lines::dispatchPacket(const Packet &packet, u64 bundleId) {
-    if (packet.channel == 0) {
+    if (packet.handle == 0) {
         // Control plane actions
-        usz offset = 0;
-        u64 action = 0;
-        if (decodeVarInt((const u8*)packet.payload.data(), packet.payload.size(), offset, action)) {
-            String subPayload((const u8*)packet.payload.data() + offset, packet.payload.size() - offset);
-            if (action == 0) handleDisconnect(subPayload);
-            else if (action == 1) handleSack(subPayload);
+        if (packet.intent == IntentDisconnect) {
+            handleDisconnect(packet.payload);
+        } else if (packet.intent == IntentSack) {
+            handleSack(packet.payload);
         }
         return;
     }
 
-    if (!packet.respectsOrder || bundleId <= base) {
+    if (!packet.ordered || bundleId <= base) {
         if (onPacket) onPacket(packet);
         return;
     }
 
     // Out-of-order packet: queue it until base advances past bundleId
-    ChannelSeq &cs = channelSequences[packet.channel];
-    cs.holQueue[bundleId] = packet;
+    HandleSeq &hs = handleSequences[packet.handle];
+    hs.holQueue[bundleId] = packet;
 }
 
 // ---------------------------------------------------------------------------
 // Control Plane Handlers
 // ---------------------------------------------------------------------------
 
-void Lines::handleProbe(const String &payload, BandSlot *slot) {
+void Lines::handleProbe(const String &payload, LinesBandSlot *slot) {
     if (payload.size() < 32) return;
     for (int i = 0; i < 32; ++i) theirEphePublic.data[i] = (u8)payload[i];
 
@@ -1265,7 +1151,6 @@ void Lines::handleProbe(const String &payload, BandSlot *slot) {
         for (usz i = 0; i < bands.size(); ++i) {
             if (bands[i] == slot) {
                 primingBandSlot = i;
-                primingBand = slot->id;
                 break;
             }
         }
@@ -1307,13 +1192,13 @@ void Lines::handleProbe(const String &payload, BandSlot *slot) {
     bundle[0] = (char)(u8)(crc & 0xFF);
     bundle[1] = (char)(u8)((crc >> 8) & 0x7F);
 
-    if (slot && slot->physical) {
-        slot->physical->push(bundle);
+    if (slot && slot->band) {
+        slot->band->push(bundle);
         lastSent = millis();
     }
 }
 
-void Lines::handleAnnounce(const String &payload, BandSlot *slot) {
+void Lines::handleAnnounce(const String &payload, LinesBandSlot *slot) {
     if (payload.size() < 40) return;
     for (int i = 0; i < 32; ++i) theirEphePublic.data[i] = (u8)payload[i];
 
@@ -1325,7 +1210,6 @@ void Lines::handleAnnounce(const String &payload, BandSlot *slot) {
         for (usz i = 0; i < bands.size(); ++i) {
             if (bands[i] == slot) {
                 primingBandSlot = i;
-                primingBand = slot->id;
                 break;
             }
         }
@@ -1363,7 +1247,7 @@ void Lines::handleAnnounce(const String &payload, BandSlot *slot) {
     if (shouldUpgrade) upgrade();
 }
 
-void Lines::handleUpgrade(const String &payload, BandSlot *slot) {
+void Lines::handleUpgrade(const String &payload, LinesBandSlot *slot) {
     if (payload.size() < 40) return;
     for (int i = 0; i < 32; ++i) theirEphePublic.data[i] = (u8)payload[i];
 
@@ -1375,7 +1259,6 @@ void Lines::handleUpgrade(const String &payload, BandSlot *slot) {
         for (usz i = 0; i < bands.size(); ++i) {
             if (bands[i] == slot) {
                 primingBandSlot = i;
-                primingBand = slot->id;
                 break;
             }
         }
@@ -1416,14 +1299,13 @@ void Lines::handleUpgrade(const String &payload, BandSlot *slot) {
     scheduleNextCuriosityHeartbeat();
 
     if (onUpgrade) onUpgrade(theirMetadata);
-    if (onReady) onReady();
 }
 
 void Lines::handleDisconnect(const String &payload) {
     Tree reason;
     hydrate(payload, reason);
     if (onDisconnect) onDisconnect(reason, false);
-    destroy();
+    reset();
 }
 
 void Lines::handleSack(const String &payload) {
@@ -1444,7 +1326,6 @@ void Lines::handleSack(const String &payload) {
         }
         for (usz i = 0; i < toPrune.size(); ++i) {
             outbox.remove(toPrune[i]);
-            if (retransmissionBuffer.has(toPrune[i])) retransmissionBuffer.remove(toPrune[i]);
         }
     }
 
@@ -1478,14 +1359,14 @@ void Lines::handleSack(const String &payload) {
 // Periodic Maintenance & Retransmission Loop
 // ---------------------------------------------------------------------------
 
-void Lines::update(bool callPBUpdates) {
+void Lines::update(bool callBandUpdates) {
     u64 now = millis();
 
-    // Call update on physical bands if requested
-    if (callPBUpdates) {
+    // Call update on bands if requested
+    if (callBandUpdates) {
         for (usz i = 0; i < bands.size(); ++i) {
-            if (bands[i] && bands[i]->physical) {
-                bands[i]->physical->update(/* doLinesUpdates = */ false);
+            if (bands[i] && bands[i]->band) {
+                bands[i]->band->update(/* doSlotUpdates = */ false);
             }
         }
     }
@@ -1493,7 +1374,7 @@ void Lines::update(bool callPBUpdates) {
     // Check Idle Timeout
     if (isUpgraded() && timeout > 0) {
         if (now - lastSeen >= timeout) {
-            destroy();
+            reset();
             return;
         }
     }
@@ -1506,19 +1387,19 @@ void Lines::update(bool callPBUpdates) {
     // Flush any pending toBeBundled packets
     flushBundles();
 
-    // Best-Effort Heartbeat (Keepalive SACK on min latency band)
+    // Keepalive SACK on best band
     if (nextBestEffortHeartbeat > 0 && now >= nextBestEffortHeartbeat) {
-        i64 idx = getBestEffortBand();
-        BandSlot *slot = (idx >= 0 && (usz)idx < bands.size()) ? bands[(usz)idx] : nullptr;
-        sendSack(Packet::BestEffort, slot);
+        i64 idx = getBestBand();
+        LinesBandSlot *slot = (idx >= 0 && (usz)idx < bands.size()) ? bands[(usz)idx] : nullptr;
+        sendSack(false, slot);
         scheduleNextBestEffortHeartbeat();
     }
 
-    // Curiosity Heartbeat (Exploratory SACK on stochastic band)
+    // Exploratory SACK on unexplored band
     if (nextCuriosityHeartbeat > 0 && now >= nextCuriosityHeartbeat) {
-        i64 idx = getBestCuriosityBand();
-        BandSlot *slot = (idx >= 0 && (usz)idx < bands.size()) ? bands[(usz)idx] : nullptr;
-        sendSack(Packet::Curiosity, slot);
+        i64 idx = selectUnexploredBand(2);
+        LinesBandSlot *slot = (idx >= 0 && (usz)idx < bands.size()) ? bands[(usz)idx] : nullptr;
+        sendSack(true, slot);
         scheduleNextCuriosityHeartbeat();
     }
 
@@ -1530,13 +1411,12 @@ void Lines::update(bool callPBUpdates) {
             if (bandRtt < 20) bandRtt = 20;
 
             if (now - sb.sentTime >= bandRtt) {
-                i64 bestIdx = getBestReliableBand();
-                BandSlot *currentBestSlot = (bestIdx >= 0 && (usz)bestIdx < bands.size()) ? bands[(usz)bestIdx] : sb.bandSlot;
-                if (currentBestSlot && currentBestSlot->physical) {
-                    currentBestSlot->physical->push(sb.bundle);
+                i64 bestIdx = getBestBand();
+                LinesBandSlot *currentBestSlot = (bestIdx >= 0 && (usz)bestIdx < bands.size()) ? bands[(usz)bestIdx] : sb.bandSlot;
+                if (currentBestSlot && currentBestSlot->band) {
+                    currentBestSlot->band->push(sb.bundle);
                     sb.sentTime = now;
                     sb.bandSlot = currentBestSlot;
-                    sb.band = currentBestSlot->id;
                     lastSent = now;
                 }
             }
@@ -1547,7 +1427,7 @@ void Lines::update(bool callPBUpdates) {
 void Lines::updateRollingStats() {
     u64 now = millis();
     for (usz i = 0; i < bands.size(); ++i) {
-        BandSlot *s = bands[i];
+        LinesBandSlot *s = bands[i];
         if (s && now - s->windowResetTime >= 1000) {
             s->bytesSentLastSec = 0;
             s->bytesRecvLastSec = 0;
